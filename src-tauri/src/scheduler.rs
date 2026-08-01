@@ -360,8 +360,12 @@ mod tests {
     fn reschedule_moves_the_next_fire() {
         let mut list = [note("mudar", "2026-07-01T10:00:00", Repeat::None)];
         // Antes de disparar, reagenda para dois dias depois.
-        reschedule_to(&mut list[0], at("2026-07-03T15:00:00"), at("2026-07-01T09:00:00"))
-            .expect("reschedule");
+        reschedule_to(
+            &mut list[0],
+            at("2026-07-03T15:00:00"),
+            at("2026-07-01T09:00:00"),
+        )
+        .expect("reschedule");
         let fired = simulate(
             &mut list,
             at("2026-07-01T00:00:00"),

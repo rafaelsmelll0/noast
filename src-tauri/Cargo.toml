@@ -1,6 +1,6 @@
 [package]
 name = "noast"
-version = "0.5.7"
+version = "0.5.8"
 description = "Noast - lembretes pessoais"
 authors = ["Rafael"]
 edition = "2021"
@@ -32,6 +32,9 @@ windows = { version = "0.58", features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-updater = "2.10.1"
 
 [profile.release]
 panic        = "abort"

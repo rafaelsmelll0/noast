@@ -1156,7 +1156,10 @@ fn show_toast_window(app: &AppHandle, reason: &'static str) {
                 let _ = window.emit("queue-updated", ());
                 log(&handle, &format!("Toast exibido pelo backend ({reason})."));
             }
-            Err(error) => log(&handle, &format!("Falha ao exibir toast ({reason}): {error}")),
+            Err(error) => log(
+                &handle,
+                &format!("Falha ao exibir toast ({reason}): {error}"),
+            ),
         }
     });
     if let Err(error) = scheduled {
@@ -1166,7 +1169,6 @@ fn show_toast_window(app: &AppHandle, reason: &'static str) {
         );
     }
 }
-
 
 fn enqueue_alert(app: &AppHandle, notification: Notification) {
     let Some(pending) = app.try_state::<PendingState>() else {
@@ -1300,7 +1302,11 @@ fn ensure_toast_presented(app: &AppHandle, unanswered_nudges: &mut u32) {
         *unanswered_nudges = 0;
         let always_on_top = app
             .try_state::<SettingsState>()
-            .and_then(|s| lock(&s.0, "configurações").ok().map(|v| v.alert_always_on_top))
+            .and_then(|s| {
+                lock(&s.0, "configurações")
+                    .ok()
+                    .map(|v| v.alert_always_on_top)
+            })
             .unwrap_or(true);
         let _ = show_without_activation(&toast, always_on_top);
         return;
@@ -1347,6 +1353,61 @@ fn start_scheduler(app: AppHandle, state: NotificationState, paths: Paths) {
     });
 }
 
+/// Verifica se há uma versão nova publicada nos Releases do GitHub e, havendo,
+/// baixa e instala. Roda em background pouco depois do startup para não
+/// competir com a inicialização. Todo o passo é registrado no log — se uma
+/// atualização falhar, o motivo fica gravado em vez de sumir em silêncio.
+#[cfg(desktop)]
+fn start_update_check(app: AppHandle) {
+    use tauri_plugin_updater::UpdaterExt;
+
+    // Respiro para o app terminar de abrir antes de usar rede/disco.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        tauri::async_runtime::spawn(async move {
+            let updater = match app.updater() {
+                Ok(updater) => updater,
+                Err(error) => {
+                    log(&app, &format!("Atualizador indisponível: {error}"));
+                    return;
+                }
+            };
+
+            let update = match updater.check().await {
+                Ok(Some(update)) => update,
+                Ok(None) => {
+                    log(&app, "Atualização: já está na versão mais recente.");
+                    return;
+                }
+                Err(error) => {
+                    log(&app, &format!("Atualização: falha ao verificar: {error}"));
+                    return;
+                }
+            };
+
+            log(
+                &app,
+                &format!(
+                    "Atualização disponível: {} (atual: {}). Baixando...",
+                    update.version, update.current_version
+                ),
+            );
+
+            let result = update
+                .download_and_install(|_chunk, _total| {}, || {})
+                .await;
+
+            match result {
+                Ok(()) => {
+                    log(&app, "Atualização instalada; reiniciando o Noast.");
+                    app.restart();
+                }
+                Err(error) => log(&app, &format!("Atualização: falha ao instalar: {error}")),
+            }
+        });
+    });
+}
+
 fn install_panic_hook(log_file: PathBuf) {
     std::panic::set_hook(Box::new(move |info| {
         let message = format!("Falha inesperada: {info}");
@@ -1368,6 +1429,12 @@ pub fn run() {
             Some(vec!["--minimized"]),
         ))
         .setup(|app| {
+            #[cfg(desktop)]
+            {
+                app.handle()
+                    .plugin(tauri_plugin_updater::Builder::new().build())?;
+                start_update_check(app.handle().clone());
+            }
             let paths = Paths {
                 notifications: notifications_path(app.handle()),
                 notes: notes_path(app.handle()),
