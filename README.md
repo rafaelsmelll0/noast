@@ -6,6 +6,16 @@ HTML/CSS/JavaScript sem framework.
 O aplicativo permanece na bandeja do sistema, verifica lembretes em segundo
 plano e apresenta uma janela compacta com ações para concluir ou adiar.
 
+## Instalação
+
+Baixe o instalador mais recente em
+[Releases](https://github.com/rafaelsmelll0/noast/releases/latest)
+(`Noast_<versão>_x64-setup.exe`) e execute.
+
+A partir da versão 0.5.8 o Noast se atualiza sozinho: ao abrir, ele verifica se
+há versão nova publicada nos Releases e, havendo, baixa e instala. O andamento
+fica registrado no log do aplicativo.
+
 ## Recursos
 
 - Lembretes únicos ou recorrentes
@@ -51,18 +61,28 @@ iniciar uma nova sessão.
 
 ## Verificação
 
+Toda a suíte (lógica de agendamento em Rust e formatação de notas em JS):
+
+```powershell
+npm run test:all
+```
+
+Separadamente:
+
+```powershell
+npm test           # node --test tests/
+npm run test:rust  # cargo test
+```
+
+Os testes do agendador usam um simulador de tempo: avançam um relógio virtual
+por semanas para validar o que dispara, avança, adia e reagenda — sem esperar.
+
+Verificações adicionais:
+
 ```powershell
 cd src-tauri
 cargo fmt --check
-cargo test
 cargo clippy --all-targets -- -D warnings
-```
-
-Para validar os scripts:
-
-```powershell
-node --check src/main.js
-node --check src/alert.js
 ```
 
 ## Build
@@ -78,6 +98,37 @@ Instalador NSIS:
 ```powershell
 npm run tauri build
 ```
+
+## Publicação de uma nova versão
+
+O aplicativo instalado descobre atualizações lendo `latest.json` do release mais
+recente. Para publicar:
+
+1. Suba a versão nos três arquivos: `package.json`, `src-tauri/Cargo.toml` e
+   `src-tauri/tauri.conf.json` (a tag do release deve ser `v<versão>`).
+2. Gere o instalador **assinado** — sem a chave privada o updater rejeita o
+   pacote:
+
+   ```powershell
+   $env:TAURI_SIGNING_PRIVATE_KEY = Get-Content "$env:USERPROFILE\.tauri\noast.key" -Raw
+   $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
+   npm run tauri build
+   ```
+
+3. Publique o instalador, o `.sig` e o `latest.json` no release:
+
+   ```powershell
+   gh release create v<versão> `
+     "src-tauri\target\release\bundle\nsis\Noast_<versão>_x64-setup.exe" `
+     "latest.json" `
+     --title "v<versão>" --notes "Descreva as mudanças."
+   ```
+
+O `latest.json` aponta a versão, a URL do instalador e a assinatura do `.sig`.
+
+> A chave privada fica em `%USERPROFILE%\.tauri\noast.key` e **nunca** deve ser
+> versionada. Sem ela não é possível publicar atualizações que o aplicativo
+> aceite.
 
 ## Dados
 

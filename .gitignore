@@ -49,3 +49,6 @@ vault.bak
 # Chave privada de assinatura do updater do Tauri
 *.pri
 ~/.tauri/
+
+# Gerado a cada release (publicado no GitHub Releases, nao versionado)
+latest.json
