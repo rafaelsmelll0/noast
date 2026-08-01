@@ -1,0 +1,51 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Artefatos de build do Rust/Tauri (pesados: chegam a centenas de MB)
+target/
+src-tauri/target/
+.codex-target/
+
+# Backup do histórico git antigo (local, não versionar)
+.git-backup-*/
+
+# Dados locais do app (lembretes/notas de desenvolvimento)
+noast_data.json
+noast_data.bak
+notes.json
+notes.bak
+settings.json
+settings.bak
+
+# Cofre e segredos — NUNCA versionar
+vault.dat
+vault.bak
+.env
+.env.*
+*.pem
+*.key
+# Chave privada de assinatura do updater do Tauri
+*.pri
+~/.tauri/

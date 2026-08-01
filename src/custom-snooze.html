@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Personalizar adiamento</title>
+    <link rel="stylesheet" href="custom-snooze.css" />
+    <script type="module" src="custom-snooze.js"></script>
+  </head>
+  <body>
+    <div class="panel" role="dialog" aria-label="Personalizar adiamento">
+      <p class="panel-title">Adiar para…</p>
+      <label class="field">
+        <span>Data</span>
+        <input id="date" type="date" />
+      </label>
+      <label class="field">
+        <span>Hora</span>
+        <input id="time" type="time" />
+      </label>
+      <p id="error" class="error" role="alert" hidden></p>
+      <div class="actions">
+        <button id="cancel" type="button" class="ghost">Cancelar</button>
+        <button id="confirm" type="button" class="primary">Confirmar</button>
+      </div>
+    </div>
+  </body>
+</html>

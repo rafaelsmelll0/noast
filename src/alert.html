@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Noast - Alertas</title>
+    <link rel="stylesheet" href="alert.css" />
+    <script type="module" src="alert.js"></script>
+  </head>
+  <body>
+    <section id="alertCard" class="alert-card" aria-labelledby="alertTitle">
+      <header class="alert-header">
+        <div class="brand-mark">
+          <img src="assets/noast-icon.svg" alt="" />
+        </div>
+        <div>
+          <p class="eyebrow">Agora</p>
+          <h1 id="alertTitle">Noast</h1>
+        </div>
+        <span id="alertCount" class="alert-count"></span>
+      </header>
+
+      <p id="alertError" class="alert-error" role="alert" hidden></p>
+      <div id="alertList" class="alert-list" aria-live="polite"></div>
+
+      <footer id="alertFooter" class="alert-footer">
+        <span id="remainingCount" class="remaining-count"></span>
+        <div class="footer-actions">
+          <button id="openNoast" class="text-button" type="button">Abrir Noast</button>
+          <button id="snoozeAll" class="text-button" type="button">Adiar todos</button>
+          <button id="completeAll" class="text-button subtle" type="button">Concluir todos</button>
+        </div>
+      </footer>
+    </section>
+  </body>
+</html>

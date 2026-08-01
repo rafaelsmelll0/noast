@@ -1,0 +1,77 @@
+:root {
+  color-scheme: light;
+  --surface: #fff;
+  --surface-soft: #f4f4f0;
+  --ink: #181814;
+  --body: #46463f;
+  --line: #dfdfd8;
+  font-family: Inter, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface: #22221e;
+  --surface-soft: #34342e;
+  --ink: #f5f5ef;
+  --body: #cdcdc4;
+  --line: #45453d;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+    --surface: #22221e;
+    --surface-soft: #34342e;
+    --ink: #f5f5ef;
+    --body: #cdcdc4;
+    --line: #45453d;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 168px;
+  height: 190px;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  padding: 3px;
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.menu {
+  display: grid;
+  gap: 2px;
+  padding: 5px;
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--line) 75%, transparent);
+  border-radius: 10px;
+  box-shadow: 0 4px 12px rgb(0 0 0 / 12%);
+}
+
+button {
+  min-height: 32px;
+  padding: 0 10px;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  color: var(--body);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+button:hover,
+button:focus-visible {
+  background: var(--surface-soft);
+  color: var(--ink);
+  outline: 0;
+}

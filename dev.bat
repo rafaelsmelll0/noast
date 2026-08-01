@@ -1,0 +1,6 @@
+@echo off
+echo Matando processos noast.exe orfaos...
+taskkill /F /IM noast.exe 2>nul
+timeout /t 1 >nul
+echo Iniciando dev...
+npm run tauri dev
