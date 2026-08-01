@@ -68,6 +68,13 @@
   scrollbar-width: thin;
 }
 
+/* Qualquer display explícito (grid, flex...) vence o `display: none` que o
+   navegador aplica a [hidden]. Sem esta regra, esconder um elemento pelo
+   atributo simplesmente não funciona. */
+[hidden] {
+  display: none !important;
+}
+
 *::-webkit-scrollbar {
   width: 8px;
   height: 8px;
