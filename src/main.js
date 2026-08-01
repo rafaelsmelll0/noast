@@ -61,6 +61,8 @@ const elements = {
   snackbar: document.querySelector("#snackbar"),
   snackbarText: document.querySelector("#snackbarText"),
   snackbarAction: document.querySelector("#snackbarAction"),
+  quickWhen: document.querySelector("#quickWhen"),
+  whenHint: document.querySelector("#whenHint"),
 };
 
 function errorMessage(error) {
@@ -308,6 +310,64 @@ function localDateParts(date) {
   };
 }
 
+function clearQuickChips() {
+  elements.quickWhen
+    .querySelectorAll(".quick-chip")
+    .forEach((chip) => chip.classList.remove("active"));
+}
+
+function applyQuickWhen(chip) {
+  const target = new Date();
+  if (chip.dataset.tomorrow) {
+    target.setDate(target.getDate() + 1);
+    target.setHours(Number(chip.dataset.tomorrow), 0, 0, 0);
+  } else {
+    target.setMinutes(target.getMinutes() + Number(chip.dataset.minutes));
+    target.setSeconds(0, 0);
+  }
+  const parts = localDateParts(target);
+  elements.date.value = parts.date;
+  elements.time.value = parts.time;
+  clearQuickChips();
+  chip.classList.add("active");
+  updateWhenHint();
+}
+
+/// Resume em texto o horário escolhido ("daqui a 2 h 30 min") e avisa quando a
+/// data já passou — antes o usuário só descobria depois de salvar.
+function updateWhenHint() {
+  const { whenHint } = elements;
+  if (!elements.date.value || !elements.time.value) {
+    whenHint.hidden = true;
+    return;
+  }
+  const target = new Date(`${elements.date.value}T${elements.time.value}:00`);
+  if (Number.isNaN(target.getTime())) {
+    whenHint.hidden = true;
+    return;
+  }
+  const diffMinutes = Math.round((target - new Date()) / 60_000);
+  whenHint.hidden = false;
+  whenHint.classList.toggle("is-past", diffMinutes < 0);
+
+  if (diffMinutes < 0) {
+    whenHint.textContent = "Esse horário já passou — o lembrete tocará assim que for salvo.";
+    return;
+  }
+  if (diffMinutes < 1) {
+    whenHint.textContent = "Tocará em menos de um minuto.";
+    return;
+  }
+  const days = Math.floor(diffMinutes / 1_440);
+  const hours = Math.floor((diffMinutes % 1_440) / 60);
+  const minutes = diffMinutes % 60;
+  const parts = [];
+  if (days) parts.push(`${days} dia${days === 1 ? "" : "s"}`);
+  if (hours) parts.push(`${hours} h`);
+  if (minutes && !days) parts.push(`${minutes} min`);
+  whenHint.textContent = `Tocará daqui a ${parts.join(" e ")}.`;
+}
+
 function openModal(notification = null, duplicate = false) {
   state.editingId = notification && !duplicate ? notification.id : null;
   elements.modalTitle.textContent = duplicate
@@ -333,6 +393,8 @@ function openModal(notification = null, duplicate = false) {
   }
 
   updateCharacterCount();
+  clearQuickChips();
+  updateWhenHint();
   elements.modal.hidden = false;
   window.setTimeout(() => elements.text.focus(), 80);
 }
@@ -350,6 +412,11 @@ function updateCharacterCount() {
 
 async function saveReminder(event) {
   event.preventDefault();
+  // Sem esta guarda, um clique duplo (ou Enter + clique) entraria duas vezes e,
+  // como cada entrada gera um id novo, criaria dois lembretes iguais.
+  const submitButton = elements.form.querySelector('button[type="submit"]');
+  if (submitButton.disabled) return;
+
   const text = elements.text.value.trim();
   if (!text || !elements.date.value || !elements.time.value) {
     elements.formError.textContent = "Preencha mensagem, data e hora.";
@@ -366,6 +433,7 @@ async function saveReminder(event) {
   };
 
   const wasEditing = Boolean(state.editingId);
+  submitButton.disabled = true;
   try {
     await invoke("save_notification", { notification });
     closeModal();
@@ -373,6 +441,8 @@ async function saveReminder(event) {
     showSnackbar(wasEditing ? "Lembrete atualizado." : "Lembrete salvo.");
   } catch (error) {
     elements.formError.textContent = errorMessage(error);
+  } finally {
+    submitButton.disabled = false;
   }
 }
 
@@ -525,6 +595,19 @@ document.querySelector("#closeWindow").addEventListener("click", () => {
 });
 elements.text.addEventListener("input", updateCharacterCount);
 elements.form.addEventListener("submit", saveReminder);
+
+elements.quickWhen.addEventListener("click", (event) => {
+  const chip = event.target.closest(".quick-chip");
+  if (chip) applyQuickWhen(chip);
+});
+
+// Editar data/hora na mão desmarca o atalho e atualiza o resumo.
+[elements.date, elements.time].forEach((input) => {
+  input.addEventListener("input", () => {
+    clearQuickChips();
+    updateWhenHint();
+  });
+});
 elements.settingsForm.addEventListener("submit", saveSettings);
 
 elements.modal.addEventListener("click", (event) => {

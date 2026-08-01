@@ -824,10 +824,15 @@ fn open_custom_snooze(
         .map_err(|error| error.to_string())?;
 
     let always_on_top = lock(&settings.0, "configurações")?.alert_always_on_top;
-    // Mesma apresentação das janelas que funcionam (toast, menu de adiamento):
-    // exibir sem ativação. Usar show() + set_focus() a partir de um app em
-    // segundo plano deixava a janela visível mas sem receber cliques no Windows.
+    // Primeiro exibe sem ativação — é o que garante que a janela apareça e
+    // receba cliques (show() + set_focus() a partir de um app em segundo plano
+    // a deixava visível porém surda). Só depois pede o foco, para o teclado
+    // funcionar (digitar a data, Enter confirmar, Esc fechar). Se o foco falhar,
+    // a janela continua utilizável no mouse.
     show_without_activation(&window, always_on_top)?;
+    if let Err(error) = window.set_focus() {
+        log(&app, &format!("Personalizar: sem foco de teclado: {error}"));
+    }
     // A janela é reutilizada: avisa o frontend para resetar (botão habilitado,
     // sugestão de horário fresca) a cada abertura.
     let _ = app.emit("custom-snooze-open", ());
@@ -1353,58 +1358,98 @@ fn start_scheduler(app: AppHandle, state: NotificationState, paths: Paths) {
     });
 }
 
-/// Verifica se há uma versão nova publicada nos Releases do GitHub e, havendo,
-/// baixa e instala. Roda em background pouco depois do startup para não
-/// competir com a inicialização. Todo o passo é registrado no log — se uma
-/// atualização falhar, o motivo fica gravado em vez de sumir em silêncio.
+/// Instalar reinicia o aplicativo, então só é aceitável quando o usuário não
+/// está no meio de algo: sem alertas na fila e com a janela principal fechada
+/// (o uso normal é pela bandeja). Caso contrário, a atualização espera a
+/// próxima rodada.
+#[cfg(desktop)]
+fn safe_to_install_update(app: &AppHandle) -> Result<(), &'static str> {
+    let busy_queue = app
+        .try_state::<PendingState>()
+        .and_then(|pending| lock(&pending.0, "alertas pendentes").ok().map(|q| !q.is_empty()))
+        .unwrap_or(false);
+    if busy_queue {
+        return Err("há lembretes na fila");
+    }
+    let main_open = app
+        .get_webview_window("main")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false);
+    if main_open {
+        return Err("a janela principal está aberta");
+    }
+    Ok(())
+}
+
+/// Verifica periodicamente se há versão nova publicada nos Releases e, havendo,
+/// baixa e instala em um momento seguro. A verificação se repete enquanto o app
+/// estiver aberto — ficar dias ligado é o uso normal, e só checar no startup
+/// deixaria essas sessões sem nunca atualizar. Cada passo é registrado no log.
 #[cfg(desktop)]
 fn start_update_check(app: AppHandle) {
     use tauri_plugin_updater::UpdaterExt;
 
-    // Respiro para o app terminar de abrir antes de usar rede/disco.
+    use std::time::Duration;
+
+    const FIRST_CHECK: Duration = Duration::from_secs(20);
+    const INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+    // Quando há atualização mas o momento é ruim, tenta de novo mais cedo.
+    const RETRY: Duration = Duration::from_secs(15 * 60);
+
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(20));
-        tauri::async_runtime::spawn(async move {
-            let updater = match app.updater() {
-                Ok(updater) => updater,
-                Err(error) => {
-                    log(&app, &format!("Atualizador indisponível: {error}"));
-                    return;
-                }
-            };
+        // Respiro para o app terminar de abrir antes de usar rede/disco.
+        std::thread::sleep(FIRST_CHECK);
+        loop {
+            let app = app.clone();
+            let postponed = tauri::async_runtime::block_on(async move {
+                let updater = match app.updater() {
+                    Ok(updater) => updater,
+                    Err(error) => {
+                        log(&app, &format!("Atualizador indisponível: {error}"));
+                        return false;
+                    }
+                };
 
-            let update = match updater.check().await {
-                Ok(Some(update)) => update,
-                Ok(None) => {
-                    log(&app, "Atualização: já está na versão mais recente.");
-                    return;
-                }
-                Err(error) => {
-                    log(&app, &format!("Atualização: falha ao verificar: {error}"));
-                    return;
-                }
-            };
+                let update = match updater.check().await {
+                    Ok(Some(update)) => update,
+                    Ok(None) => return false,
+                    Err(error) => {
+                        log(&app, &format!("Atualização: falha ao verificar: {error}"));
+                        return false;
+                    }
+                };
 
-            log(
-                &app,
-                &format!(
-                    "Atualização disponível: {} (atual: {}). Baixando...",
-                    update.version, update.current_version
-                ),
-            );
-
-            let result = update
-                .download_and_install(|_chunk, _total| {}, || {})
-                .await;
-
-            match result {
-                Ok(()) => {
-                    log(&app, "Atualização instalada; reiniciando o Noast.");
-                    app.restart();
+                if let Err(reason) = safe_to_install_update(&app) {
+                    log(
+                        &app,
+                        &format!(
+                            "Atualização {} disponível, adiada porque {reason}.",
+                            update.version
+                        ),
+                    );
+                    return true;
                 }
-                Err(error) => log(&app, &format!("Atualização: falha ao instalar: {error}")),
-            }
-        });
+
+                log(
+                    &app,
+                    &format!(
+                        "Atualização disponível: {} (atual: {}). Baixando...",
+                        update.version, update.current_version
+                    ),
+                );
+
+                match update.download_and_install(|_chunk, _total| {}, || {}).await {
+                    Ok(()) => {
+                        log(&app, "Atualização instalada; reiniciando o Noast.");
+                        app.restart();
+                    }
+                    Err(error) => log(&app, &format!("Atualização: falha ao instalar: {error}")),
+                }
+                false
+            });
+
+            std::thread::sleep(if postponed { RETRY } else { INTERVAL });
+        }
     });
 }
 

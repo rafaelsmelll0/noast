@@ -25,11 +25,18 @@ function clearError() {
   errorEl.textContent = "";
 }
 
+const pad = (n) => String(n).padStart(2, "0");
+
+function dateValue(date) {
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
 function prefillDefaults() {
   const suggestion = new Date(Date.now() + 60 * 60 * 1000);
-  const pad = (n) => String(n).padStart(2, "0");
-  dateInput.value = `${suggestion.getFullYear()}-${pad(suggestion.getMonth() + 1)}-${pad(suggestion.getDate())}`;
+  dateInput.value = dateValue(suggestion);
   timeInput.value = `${pad(suggestion.getHours())}:${pad(suggestion.getMinutes())}`;
+  // Impede escolher um dia passado já no seletor, em vez de só recusar depois.
+  dateInput.min = dateValue(new Date());
 }
 
 // A janela é reutilizada (mostrada/ocultada), não recriada. Este reset devolve
@@ -54,6 +61,9 @@ async function init() {
 }
 
 async function confirm() {
+  // Enter repetido (ou clique duplo) chegaria aqui duas vezes antes do primeiro
+  // reagendamento terminar.
+  if (confirmBtn.disabled) return;
   clearError();
   if (!dateInput.value || !timeInput.value) {
     showError("Escolha data e hora.");

@@ -39,6 +39,18 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+/// Quanto tempo faz que o horário passou. Importante quando o computador ficou
+/// desligado: o alerta pode ser de horas atrás, e só a hora não deixa claro.
+function overdueSuffix(date, now) {
+  const minutes = Math.floor((now - date) / 60_000);
+  if (minutes < 2) return "";
+  if (minutes < 60) return ` · há ${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return ` · há ${hours} h`;
+  const days = Math.floor(hours / 24);
+  return ` · há ${days} dia${days === 1 ? "" : "s"}`;
+}
+
 function formatDateTime(value) {
   const date = new Date(value);
   const now = new Date();
@@ -50,13 +62,16 @@ function formatDateTime(value) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(date);
-  if (sameDay) return `Hoje, ${time}`;
-  return new Intl.DateTimeFormat("pt-BR", {
-    day: "2-digit",
-    month: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(date);
+  const late = overdueSuffix(date, now);
+  if (sameDay) return `Hoje, ${time}${late}`;
+  return (
+    new Intl.DateTimeFormat("pt-BR", {
+      day: "2-digit",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(date) + late
+  );
 }
 
 function applyTheme(theme) {

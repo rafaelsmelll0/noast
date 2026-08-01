@@ -491,19 +491,26 @@ export function createNotesController({ invoke, showSnackbar, confirmAction }) {
 
     event.preventDefault?.();
 
-    const rest = node.textContent.slice(range.startOffset);
-
     const listTag = numberMatch ? "ol" : "ul";
     const list = document.createElement(listTag);
     if (numberMatch && startNumber !== 1) {
       list.setAttribute("start", String(startNumber));
     }
     const li = document.createElement("li");
-    li.appendChild(document.createTextNode(rest));
-    if (!rest) li.appendChild(document.createElement("br"));
-    list.appendChild(li);
 
-    replaceBlockWith(block, node, list);
+    // Descarta só o gatilho digitado ("1. " ou "- "), preservando o restante da
+    // linha — inclusive trechos em outros nós, como negrito, que seriam
+    // perdidos se o bloco inteiro fosse substituído.
+    node.textContent = node.textContent.slice(range.startOffset);
+    if (!block || block === elements.preview) {
+      elements.preview.insertBefore(list, node);
+      li.appendChild(node);
+    } else {
+      block.replaceWith(list);
+      while (block.firstChild) li.appendChild(block.firstChild);
+    }
+    if (!li.firstChild) li.appendChild(document.createElement("br"));
+    list.appendChild(li);
 
     const r = document.createRange();
     r.setStart(li.firstChild ?? li, 0);
@@ -534,15 +541,6 @@ export function createNotesController({ invoke, showSnackbar, confirmAction }) {
     probe.selectNodeContents(block);
     probe.setEnd(node, 0);
     return probe.toString().length === 0;
-  }
-
-  function replaceBlockWith(block, node, list) {
-    if (!block || block === elements.preview) {
-      elements.preview.insertBefore(list, node);
-      node.remove();
-    } else {
-      block.replaceWith(list);
-    }
   }
 
   async function load() {

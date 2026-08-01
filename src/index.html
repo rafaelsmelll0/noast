@@ -451,6 +451,15 @@
             <textarea id="reminderText" maxlength="80" rows="3" placeholder="O que você quer lembrar?"></textarea>
             <small><span id="characterCount">0</span>/80</small>
           </label>
+          <div class="form-field">
+            <span>Quando</span>
+            <div id="quickWhen" class="quick-when" role="group" aria-label="Atalhos de horário">
+              <button type="button" class="quick-chip" data-minutes="30">Em 30 min</button>
+              <button type="button" class="quick-chip" data-minutes="60">Em 1 hora</button>
+              <button type="button" class="quick-chip" data-minutes="180">Em 3 horas</button>
+              <button type="button" class="quick-chip" data-tomorrow="9">Amanhã 9h</button>
+            </div>
+          </div>
           <div class="form-grid">
             <label class="form-field">
               <span>Data</span>
@@ -461,6 +470,7 @@
               <input id="reminderTime" type="time" />
             </label>
           </div>
+          <p id="whenHint" class="when-hint" hidden></p>
           <label class="form-field">
             <span>Repetição</span>
             <select id="reminderRepeat">
