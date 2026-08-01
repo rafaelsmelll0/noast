@@ -25,7 +25,11 @@ pub fn advance_after(notification: &mut Notification, now: NaiveDateTime) -> Res
         return Ok(());
     }
 
-    let mut datetime = notification.parsed_datetime()?;
+    // Parte do horário da série, não de onde o lembrete foi parar por
+    // adiamento: concluir um "toda terça 9h" adiado para quinta mantém a
+    // série na terça. O laço avança quantas ocorrências forem necessárias,
+    // então adiar além da próxima terça também cai na terça seguinte.
+    let mut datetime = notification.series_anchor()?;
     let mut guard = 0;
     while datetime <= now {
         datetime = next_occurrence(datetime, notification.repeat);
@@ -36,12 +40,14 @@ pub fn advance_after(notification: &mut Notification, now: NaiveDateTime) -> Res
     }
 
     notification.datetime = datetime.format("%Y-%m-%dT%H:%M:%S").to_string();
+    notification.series_datetime.clear();
     notification.done = false;
     notification.last_fired.clear();
     Ok(())
 }
 
 pub fn snooze(notification: &mut Notification, minutes: u32, now: NaiveDateTime) {
+    notification.remember_series_anchor();
     notification.datetime = (now + Duration::minutes(i64::from(minutes)))
         .format("%Y-%m-%dT%H:%M:%S")
         .to_string();
@@ -54,6 +60,7 @@ pub fn snooze_until_tomorrow(
     now: NaiveDateTime,
 ) -> Result<(), String> {
     let original = notification.parsed_datetime()?;
+    notification.remember_series_anchor();
     let tomorrow = now.date() + Duration::days(1);
     notification.datetime = tomorrow
         .and_time(original.time())
@@ -72,6 +79,9 @@ pub fn reschedule_to(
     if target <= now {
         return Err("Escolha uma data e hora no futuro.".to_string());
     }
+    // Reagendar pelo toast é um adiamento pontual: a série continua no horário
+    // programado (editar o lembrete na janela principal é que a redefine).
+    notification.remember_series_anchor();
     notification.datetime = target.format("%Y-%m-%dT%H:%M:%S").to_string();
     notification.done = false;
     notification.last_fired.clear();
@@ -155,6 +165,7 @@ mod tests {
             repeat: Repeat::None,
             done: false,
             last_fired: "2026-01-10T10:00".into(),
+            series_datetime: String::new(),
         };
         let now = at("2026-01-10T10:01:00");
         assert!(!is_due(&notification, now, false));
@@ -170,6 +181,7 @@ mod tests {
             repeat: Repeat::Daily,
             done: false,
             last_fired: "2026-01-01T10:00".into(),
+            series_datetime: String::new(),
         };
         advance_after(&mut notification, at("2026-01-03T12:00:00")).expect("advance");
         assert_eq!(notification.datetime, "2026-01-04T10:00:00");
@@ -185,6 +197,7 @@ mod tests {
             repeat: Repeat::None,
             done: false,
             last_fired: "2026-06-13T08:45".into(),
+            series_datetime: String::new(),
         };
         snooze_until_tomorrow(&mut notification, at("2026-06-13T22:10:00"))
             .expect("snooze tomorrow");
@@ -201,6 +214,7 @@ mod tests {
             repeat: Repeat::None,
             done: false,
             last_fired: "2026-06-13T08:45".into(),
+            series_datetime: String::new(),
         };
         let now = at("2026-06-13T22:10:00");
         assert!(reschedule_to(&mut notification, at("2026-06-13T20:00:00"), now).is_err());
@@ -224,7 +238,76 @@ mod tests {
             repeat,
             done: false,
             last_fired: String::new(),
+            series_datetime: String::new(),
         }
+    }
+
+    // 2026-07-07 é uma terça-feira; usada como âncora nos testes de série.
+    #[test]
+    fn snoozing_a_weekly_keeps_the_series_on_the_original_slot() {
+        let mut weekly = note("semanal", "2026-07-07T09:00:00", Repeat::Weekly);
+
+        // Adiado três vezes ao longo da terça, terminando às 14h.
+        snooze(&mut weekly, 60, at("2026-07-07T09:05:00"));
+        snooze(&mut weekly, 60, at("2026-07-07T10:10:00"));
+        snooze(&mut weekly, 180, at("2026-07-07T11:15:00"));
+        assert_eq!(weekly.datetime, "2026-07-07T14:15:00");
+        // A âncora da série permanece na terça 9h, mesmo após vários adiamentos.
+        assert_eq!(weekly.series_datetime, "2026-07-07T09:00:00");
+
+        advance_after(&mut weekly, at("2026-07-07T14:20:00")).expect("advance");
+        // Próxima terça, 9h — e não terça 14h15.
+        assert_eq!(weekly.datetime, "2026-07-14T09:00:00");
+        assert!(weekly.series_datetime.is_empty());
+    }
+
+    // Caso-limite: adiar tanto que passa da próxima ocorrência programada.
+    #[test]
+    fn snoozing_past_the_next_occurrence_skips_to_a_future_one() {
+        let mut weekly = note("semanal", "2026-07-07T09:00:00", Repeat::Weekly);
+
+        // Adia 9 dias: cai depois da terça seguinte (14/07).
+        snooze(&mut weekly, 9 * 24 * 60, at("2026-07-07T09:05:00"));
+        assert_eq!(weekly.datetime, "2026-07-16T09:05:00");
+
+        advance_after(&mut weekly, at("2026-07-16T09:10:00")).expect("advance");
+        // A ocorrência de 14/07 já passou; a série segue na terça 21/07.
+        assert_eq!(weekly.datetime, "2026-07-21T09:00:00");
+    }
+
+    #[test]
+    fn custom_reschedule_also_preserves_the_series() {
+        let mut weekly = note("semanal", "2026-07-07T09:00:00", Repeat::Weekly);
+        reschedule_to(
+            &mut weekly,
+            at("2026-07-09T15:30:00"),
+            at("2026-07-07T09:05:00"),
+        )
+        .expect("reschedule");
+        assert_eq!(weekly.series_datetime, "2026-07-07T09:00:00");
+
+        advance_after(&mut weekly, at("2026-07-09T15:35:00")).expect("advance");
+        assert_eq!(weekly.datetime, "2026-07-14T09:00:00");
+    }
+
+    #[test]
+    fn snooze_until_tomorrow_preserves_the_series_too() {
+        let mut weekly = note("semanal", "2026-07-07T09:00:00", Repeat::Weekly);
+        snooze_until_tomorrow(&mut weekly, at("2026-07-07T22:00:00")).expect("tomorrow");
+        assert_eq!(weekly.datetime, "2026-07-08T09:00:00");
+        assert_eq!(weekly.series_datetime, "2026-07-07T09:00:00");
+
+        advance_after(&mut weekly, at("2026-07-08T09:05:00")).expect("advance");
+        assert_eq!(weekly.datetime, "2026-07-14T09:00:00");
+    }
+
+    // Adiar um lembrete sem repetição não deve inventar âncora de série.
+    #[test]
+    fn snoozing_a_one_off_keeps_no_series_anchor() {
+        let mut once = note("pontual", "2026-07-07T09:00:00", Repeat::None);
+        snooze(&mut once, 30, at("2026-07-07T09:05:00"));
+        assert!(once.series_datetime.is_empty());
+        assert_eq!(once.datetime, "2026-07-07T09:35:00");
     }
 
     /// Ação que o "usuário" (ou o app) toma quando um lembrete dispara.

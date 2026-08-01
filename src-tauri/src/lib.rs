@@ -186,6 +186,10 @@ fn save_notification(
             if existing.datetime == notification.datetime && existing.repeat == notification.repeat
             {
                 notification.last_fired = existing.last_fired.clone();
+                // Editar só o texto de um lembrete adiado não pode mover a
+                // série; alterar data ou repetição, sim — aí a âncora antiga
+                // não vale mais e é descartada.
+                notification.series_datetime = existing.series_datetime.clone();
             } else {
                 notification.last_fired.clear();
                 notification.done = false;
@@ -353,6 +357,27 @@ fn save_vault_client(
 
     {
         let mut vault = lock(&state.0, "cofre")?;
+        if !client.parent_id.is_empty() {
+            let parent = vault
+                .clients
+                .iter()
+                .find(|item| item.id == client.parent_id)
+                .ok_or_else(|| "Responsável não encontrado.".to_string())?;
+            // Dois níveis apenas: quem já está dentro de alguém não agrupa outros.
+            if !parent.parent_id.is_empty() {
+                return Err(
+                    "Só é possível agrupar em um nível: escolha um responsável principal."
+                        .to_string(),
+                );
+            }
+            // Virar filho de alguém exigiria realocar os próprios filhos.
+            if vault.clients.iter().any(|item| item.parent_id == client.id) {
+                return Err(
+                    "Este cliente já agrupa outros; mova-os antes de colocá-lo dentro de alguém."
+                        .to_string(),
+                );
+            }
+        }
         let mut next = vault.clone();
         if let Some(index) = next.clients.iter().position(|item| item.id == client.id) {
             client.created_at = next.clients[index].created_at.clone();
@@ -383,6 +408,11 @@ fn delete_vault_client(
         return Err("Cliente não encontrado.".to_string());
     }
     next.accesses.retain(|item| item.client_id != id);
+    // Quem era agrupado por ele volta a ser raiz: excluir um responsável não
+    // pode arrastar junto os clientes (e as senhas) que estavam dentro dele.
+    for child in next.clients.iter_mut().filter(|item| item.parent_id == id) {
+        child.parent_id.clear();
+    }
     persist_vault(&paths, &next)?;
     *vault = next;
     Ok(())

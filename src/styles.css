@@ -2060,6 +2060,110 @@ h1 {
   color: var(--surface);
 }
 
+.field-hint {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+/* Cofre: agrupamento de clientes por responsável */
+.vault-group {
+  display: grid;
+  gap: 2px;
+}
+
+.vault-group-header {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  width: 100%;
+  padding: 7px 9px;
+  background: transparent;
+  border: 0;
+  border-radius: 10px;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.vault-group-header:hover {
+  background: var(--surface-soft);
+  color: var(--ink);
+}
+
+.vault-group-header svg {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.4;
+  transition: transform 0.15s ease;
+}
+
+.vault-group-header[aria-expanded="false"] svg {
+  transform: rotate(-90deg);
+}
+
+.vault-group-header .vault-group-name {
+  overflow: hidden;
+  flex: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vault-group-children {
+  display: grid;
+  gap: 2px;
+  margin-left: 10px;
+  padding-left: 8px;
+  border-left: 1px solid var(--line);
+}
+
+.vault-group-children[hidden] {
+  display: none;
+}
+
+.weekday-picker {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 4px;
+}
+
+.weekday {
+  padding: 8px 0;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--body);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.weekday:hover {
+  background: var(--surface-hover);
+  color: var(--ink);
+}
+
+.weekday:focus-visible {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+.weekday.active {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--surface);
+}
+
 .when-hint {
   margin: -4px 0 0;
   color: var(--muted);
@@ -2075,7 +2179,9 @@ h1 {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .quick-chip {
+  .quick-chip,
+  .weekday,
+  .vault-group-header svg {
     transition: none;
   }
 }

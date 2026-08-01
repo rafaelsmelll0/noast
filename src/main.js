@@ -63,6 +63,8 @@ const elements = {
   snackbarAction: document.querySelector("#snackbarAction"),
   quickWhen: document.querySelector("#quickWhen"),
   whenHint: document.querySelector("#whenHint"),
+  weekdayField: document.querySelector("#weekdayField"),
+  weekdayPicker: document.querySelector("#weekdayPicker"),
 };
 
 function errorMessage(error) {
@@ -310,6 +312,46 @@ function localDateParts(date) {
   };
 }
 
+// O seletor de dia só faz sentido para repetições semanais; nas demais, o dia
+// vem da própria data escolhida.
+const WEEKDAY_REPEATS = new Set(["weekly", "biweekly"]);
+
+/// Move a data para a próxima ocorrência do dia da semana escolhido, mantendo a
+/// hora. Assim o usuário escolhe "toda terça" sem precisar descobrir qual data
+/// cai numa terça.
+function applyWeekday(weekday) {
+  const base = elements.date.value ? new Date(`${elements.date.value}T12:00:00`) : new Date();
+  const shift = (weekday - base.getDay() + 7) % 7;
+  // Já é o dia certo: mantém a data em vez de empurrar uma semana à frente.
+  base.setDate(base.getDate() + shift);
+  // Se cair hoje mas o horário já passou (escolher "terça 9h" numa terça às
+  // 14h), a série começa na semana seguinte em vez de nascer atrasada.
+  if (elements.time.value) {
+    const candidate = new Date(`${localDateParts(base).date}T${elements.time.value}:00`);
+    if (candidate < new Date()) base.setDate(base.getDate() + 7);
+  }
+  elements.date.value = localDateParts(base).date;
+  syncWeekdayPicker();
+  clearQuickChips();
+  updateWhenHint();
+}
+
+/// Marca o dia correspondente à data atual e mostra/esconde o seletor conforme
+/// a repetição escolhida.
+function syncWeekdayPicker() {
+  const weekly = WEEKDAY_REPEATS.has(elements.repeat.value);
+  elements.weekdayField.hidden = !weekly;
+  if (!weekly) return;
+  const current = elements.date.value
+    ? new Date(`${elements.date.value}T12:00:00`).getDay()
+    : null;
+  elements.weekdayPicker.querySelectorAll(".weekday").forEach((button) => {
+    const active = Number(button.dataset.weekday) === current;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+}
+
 function clearQuickChips() {
   elements.quickWhen
     .querySelectorAll(".quick-chip")
@@ -394,6 +436,7 @@ function openModal(notification = null, duplicate = false) {
 
   updateCharacterCount();
   clearQuickChips();
+  syncWeekdayPicker();
   updateWhenHint();
   elements.modal.hidden = false;
   window.setTimeout(() => elements.text.focus(), 80);
@@ -605,8 +648,16 @@ elements.quickWhen.addEventListener("click", (event) => {
 [elements.date, elements.time].forEach((input) => {
   input.addEventListener("input", () => {
     clearQuickChips();
+    syncWeekdayPicker();
     updateWhenHint();
   });
+});
+
+elements.repeat.addEventListener("change", syncWeekdayPicker);
+
+elements.weekdayPicker.addEventListener("click", (event) => {
+  const button = event.target.closest(".weekday");
+  if (button) applyWeekday(Number(button.dataset.weekday));
 });
 elements.settingsForm.addEventListener("submit", saveSettings);
 

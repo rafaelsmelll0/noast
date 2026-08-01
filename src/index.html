@@ -482,6 +482,18 @@
               <option value="yearly">Todo ano</option>
             </select>
           </label>
+          <div id="weekdayField" class="form-field" hidden>
+            <span>Repetir</span>
+            <div id="weekdayPicker" class="weekday-picker" role="group" aria-label="Dia da semana">
+              <button type="button" class="weekday" data-weekday="1" aria-label="Segunda-feira">Seg</button>
+              <button type="button" class="weekday" data-weekday="2" aria-label="Terça-feira">Ter</button>
+              <button type="button" class="weekday" data-weekday="3" aria-label="Quarta-feira">Qua</button>
+              <button type="button" class="weekday" data-weekday="4" aria-label="Quinta-feira">Qui</button>
+              <button type="button" class="weekday" data-weekday="5" aria-label="Sexta-feira">Sex</button>
+              <button type="button" class="weekday" data-weekday="6" aria-label="Sábado">Sáb</button>
+              <button type="button" class="weekday" data-weekday="0" aria-label="Domingo">Dom</button>
+            </div>
+          </div>
           <p id="formError" class="form-error" role="alert"></p>
           <div class="modal-footer">
             <button id="cancelModal" class="button secondary" type="button">Cancelar</button>
@@ -506,6 +518,15 @@
           <label class="form-field">
             <span>Nome do cliente</span>
             <input id="vaultClientNameInput" type="text" maxlength="120" placeholder="Ex.: Empresa Exemplo" autocomplete="off" />
+          </label>
+          <label class="form-field">
+            <span>Dentro de</span>
+            <select id="vaultClientParentInput">
+              <option value="">Nenhum — cliente principal</option>
+            </select>
+            <small id="vaultClientParentHint" class="field-hint">
+              Agrupe quando alguém administra as contas de vários clientes.
+            </small>
           </label>
           <label class="form-field">
             <span>Observações</span>

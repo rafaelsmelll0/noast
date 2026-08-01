@@ -69,6 +69,7 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     editingAccessId: null,
     clipboardVersion: 0,
     revealTimers: new Map(),
+    collapsedGroups: new Set(),
   };
 
   const elements = {
@@ -88,6 +89,8 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     clientModalTitle: document.querySelector("#vaultClientModalTitle"),
     clientForm: document.querySelector("#vaultClientForm"),
     clientNameInput: document.querySelector("#vaultClientNameInput"),
+    clientParentInput: document.querySelector("#vaultClientParentInput"),
+    clientParentHint: document.querySelector("#vaultClientParentHint"),
     clientNotesInput: document.querySelector("#vaultClientNotesInput"),
     clientError: document.querySelector("#vaultClientFormError"),
     accessModal: document.querySelector("#vaultAccessModal"),
@@ -134,22 +137,77 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
   }
 
+  const childrenOf = (parentId) =>
+    state.clients
+      .filter((client) => client.parent_id === parentId)
+      .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+
+  /// Acessos do próprio cliente somados aos de quem ele agrupa — o responsável
+  /// mostra o total pelo qual responde, mesmo sem acessos diretos.
+  function totalAccesses(clientId) {
+    return childrenOf(clientId).reduce(
+      (total, child) => total + clientAccesses(child.id).length,
+      clientAccesses(clientId).length,
+    );
+  }
+
+  function clientItemHtml(client, count) {
+    return `
+      <button class="vault-client-item${client.id === state.selectedClientId ? " active" : ""}" type="button" data-vault-client="${escapeHtml(client.id)}">
+        <span class="vault-client-avatar" aria-hidden="true">${escapeHtml(initials(client.name))}</span>
+        <span class="vault-client-item-copy">
+          <strong>${escapeHtml(client.name)}</strong>
+          <small>${count} acesso${count === 1 ? "" : "s"}</small>
+        </span>
+        <span class="vault-client-count">${count}</span>
+      </button>`;
+  }
+
   function renderClientList() {
     const clients = filteredClients();
     elements.count.textContent = state.accesses.length;
     elements.listEmpty.hidden = clients.length > 0;
-    elements.list.innerHTML = clients
-      .map((client) => {
-        const count = clientAccesses(client.id).length;
+
+    const visible = new Set(clients.map((client) => client.id));
+    // Buscando, um filho encontrado precisa aparecer sob o responsável dele.
+    const roots = clients.filter((client) => !client.parent_id);
+    const orphanParents = clients
+      .filter((client) => client.parent_id && !visible.has(client.parent_id))
+      .map((client) => state.clients.find((item) => item.id === client.parent_id))
+      .filter(Boolean);
+    const allRoots = [...new Map([...roots, ...orphanParents].map((c) => [c.id, c])).values()].sort(
+      (a, b) => a.name.localeCompare(b.name, "pt-BR"),
+    );
+
+    elements.list.innerHTML = allRoots
+      .map((root) => {
+        const children = childrenOf(root.id).filter(
+          // Quando o próprio responsável casa com a busca, mostra tudo o que
+          // ele agrupa; senão, só os filhos que casaram.
+          (child) => !state.query || visible.has(child.id) || visible.has(root.id),
+        );
+        const rootHtml = clientItemHtml(root, clientAccesses(root.id).length);
+        if (children.length === 0) return rootHtml;
+
+        // Durante a busca os grupos ficam abertos, senão o resultado sumiria.
+        // Um grupo também não fica fechado escondendo o cliente aberto.
+        const holdsSelection =
+          root.id === state.selectedClientId ||
+          children.some((child) => child.id === state.selectedClientId);
+        const collapsed =
+          !state.query && state.collapsedGroups.has(root.id) && !holdsSelection;
         return `
-          <button class="vault-client-item${client.id === state.selectedClientId ? " active" : ""}" type="button" data-vault-client="${escapeHtml(client.id)}">
-            <span class="vault-client-avatar" aria-hidden="true">${escapeHtml(initials(client.name))}</span>
-            <span class="vault-client-item-copy">
-              <strong>${escapeHtml(client.name)}</strong>
-              <small>${count} acesso${count === 1 ? "" : "s"}</small>
-            </span>
-            <span class="vault-client-count">${count}</span>
-          </button>`;
+          <div class="vault-group">
+            <button class="vault-group-header" type="button" data-vault-group="${escapeHtml(root.id)}" aria-expanded="${!collapsed}">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+              <span class="vault-group-name">${escapeHtml(root.name)}</span>
+              <span>${totalAccesses(root.id)}</span>
+            </button>
+            <div class="vault-group-children"${collapsed ? " hidden" : ""}>
+              ${rootHtml}
+              ${children.map((child) => clientItemHtml(child, clientAccesses(child.id).length)).join("")}
+            </div>
+          </div>`;
       })
       .join("");
   }
@@ -213,7 +271,17 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       : allAccesses;
     elements.clientName.textContent = client.name;
     elements.clientAvatar.textContent = initials(client.name);
-    elements.clientSummary.textContent = `${allAccesses.length} acesso${allAccesses.length === 1 ? "" : "s"} cadastrado${allAccesses.length === 1 ? "" : "s"}`;
+    // Deixa claro de quem é o cliente aberto, ou quantos ele agrupa.
+    const parent = client.parent_id
+      ? state.clients.find((item) => item.id === client.parent_id)
+      : null;
+    const children = childrenOf(client.id);
+    const context = parent
+      ? ` · em ${parent.name}`
+      : children.length
+        ? ` · agrupa ${children.length} cliente${children.length === 1 ? "" : "s"}`
+        : "";
+    elements.clientSummary.textContent = `${allAccesses.length} acesso${allAccesses.length === 1 ? "" : "s"} cadastrado${allAccesses.length === 1 ? "" : "s"}${context}`;
     elements.clientNotes.textContent = client.notes;
     elements.clientNotes.hidden = !client.notes;
     elements.accessList.innerHTML = accesses.map(cardHtml).join("");
@@ -246,11 +314,35 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     elements.clientError.textContent = "";
   }
 
+  /// Monta as opções de responsável. Só clientes principais podem agrupar (a
+  /// hierarquia tem dois níveis), e quem já agrupa outros não pode virar filho.
+  function fillParentOptions(client) {
+    const select = elements.clientParentInput;
+    const hasChildren = client ? childrenOf(client.id).length > 0 : false;
+    const candidates = state.clients
+      .filter((item) => !item.parent_id && item.id !== client?.id)
+      .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+
+    select.innerHTML = `<option value="">Nenhum — cliente principal</option>${candidates
+      .map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`)
+      .join("")}`;
+    select.value = client?.parent_id ?? "";
+    select.disabled = hasChildren;
+    elements.clientParentHint.textContent = hasChildren
+      ? "Este cliente agrupa outros, por isso não pode ficar dentro de alguém."
+      : "Agrupe quando alguém administra as contas de vários clientes.";
+  }
+
   function openClientModal(client = null) {
     state.editingClientId = client?.id ?? null;
     elements.clientModalTitle.textContent = client ? "Editar cliente" : "Novo cliente";
     elements.clientNameInput.value = client?.name ?? "";
     elements.clientNotesInput.value = client?.notes ?? "";
+    // Criar a partir de um responsável selecionado já vem agrupado nele.
+    const suggestedParent =
+      !client && selectedClient() && !selectedClient().parent_id ? selectedClient().id : "";
+    fillParentOptions(client);
+    if (!client && suggestedParent) elements.clientParentInput.value = suggestedParent;
     elements.clientError.textContent = "";
     elements.clientModal.hidden = false;
     window.setTimeout(() => elements.clientNameInput.focus(), 50);
@@ -267,6 +359,7 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     const client = {
       id: current?.id ?? crypto.randomUUID(),
       name,
+      parent_id: elements.clientParentInput.value,
       notes: elements.clientNotesInput.value.trim(),
       created_at: current?.created_at ?? "",
       updated_at: current?.updated_at ?? "",
@@ -288,9 +381,13 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     const client = selectedClient();
     if (!client) return;
     const count = clientAccesses(client.id).length;
-    const warning = count
+    const children = childrenOf(client.id);
+    let warning = count
       ? `Excluir "${client.name}" e seus ${count} acesso${count === 1 ? "" : "s"}? Esta ação não pode ser desfeita.`
       : `Excluir o cliente "${client.name}"?`;
+    if (children.length) {
+      warning += ` Os ${children.length} cliente${children.length === 1 ? "" : "s"} agrupado${children.length === 1 ? "" : "s"} não ${children.length === 1 ? "será excluído" : "serão excluídos"} — ${children.length === 1 ? "passará" : "passarão"} a aparecer como cliente principal.`;
+    }
     const confirmed = await confirmAction({
       dialogTitle: "Excluir cliente?",
       dialogMessage: warning,
@@ -301,6 +398,10 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       await invoke("delete_vault_client", { id: client.id });
       state.clients = state.clients.filter((item) => item.id !== client.id);
       state.accesses = state.accesses.filter((item) => item.client_id !== client.id);
+      // Espelha a promoção feita no backend, sem precisar recarregar o cofre.
+      state.clients.forEach((item) => {
+        if (item.parent_id === client.id) item.parent_id = "";
+      });
       selectClient(filteredClients()[0]?.id ?? null);
       showSnackbar("Cliente excluído do cofre.");
     } catch (error) {
@@ -581,6 +682,14 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
   });
 
   elements.list.addEventListener("click", (event) => {
+    const group = event.target.closest("[data-vault-group]");
+    if (group) {
+      const id = group.dataset.vaultGroup;
+      if (state.collapsedGroups.has(id)) state.collapsedGroups.delete(id);
+      else state.collapsedGroups.add(id);
+      renderClientList();
+      return;
+    }
     const item = event.target.closest("[data-vault-client]");
     if (item) selectClient(item.dataset.vaultClient);
   });

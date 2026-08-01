@@ -28,6 +28,11 @@ pub struct Vault {
 pub struct VaultClient {
     pub id: String,
     pub name: String,
+    /// Responsável que agrupa este cliente (ex.: a pessoa que administra as
+    /// contas de várias empresas). Vazio quando o cliente é raiz. A hierarquia
+    /// tem no máximo dois níveis: quem tem pai não pode ser pai de outro.
+    #[serde(default)]
+    pub parent_id: String,
     #[serde(default)]
     pub notes: String,
     #[serde(default)]
@@ -43,6 +48,9 @@ impl VaultClient {
         }
         if self.name.trim().is_empty() {
             return Err("O nome do cliente é obrigatório.".to_string());
+        }
+        if !self.parent_id.is_empty() && self.parent_id == self.id {
+            return Err("Um cliente não pode estar dentro dele mesmo.".to_string());
         }
         if self.name.chars().count() > 120 {
             return Err("O nome do cliente deve ter no máximo 120 caracteres.".to_string());
@@ -179,6 +187,7 @@ pub enum Repeat {
 pub struct Notification {
     pub id: String,
     pub text: String,
+    /// Quando o lembrete vai tocar. Um adiamento altera este campo.
     pub datetime: String,
     #[serde(default)]
     pub repeat: Repeat,
@@ -186,12 +195,36 @@ pub struct Notification {
     pub done: bool,
     #[serde(default)]
     pub last_fired: String,
+    /// Horário oficial da série enquanto o lembrete está adiado. Sem isto, um
+    /// "toda terça 9h" adiado para quinta 14h viraria "toda quinta 14h" ao ser
+    /// concluído. Vazio quando `datetime` já é o horário da série.
+    #[serde(default)]
+    pub series_datetime: String,
 }
 
 impl Notification {
     pub fn parsed_datetime(&self) -> Result<NaiveDateTime, String> {
         NaiveDateTime::parse_from_str(&self.datetime, "%Y-%m-%dT%H:%M:%S")
             .map_err(|_| "Data e hora inválidas.".to_string())
+    }
+
+    /// Base para calcular a próxima ocorrência: o horário da série, que
+    /// sobrevive a adiamentos.
+    pub fn series_anchor(&self) -> Result<NaiveDateTime, String> {
+        if self.series_datetime.is_empty() {
+            return self.parsed_datetime();
+        }
+        NaiveDateTime::parse_from_str(&self.series_datetime, "%Y-%m-%dT%H:%M:%S")
+            .or_else(|_| self.parsed_datetime())
+    }
+
+    /// Guarda o horário da série antes de um adiamento sobrescrever `datetime`.
+    /// Só faz sentido para lembretes recorrentes, e apenas no primeiro
+    /// adiamento — adiar de novo não pode mover a âncora.
+    pub fn remember_series_anchor(&mut self) {
+        if self.repeat != Repeat::None && self.series_datetime.is_empty() {
+            self.series_datetime = self.datetime.clone();
+        }
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -296,6 +329,31 @@ mod tests {
         value.title.clear();
         value.content = "a".repeat(50_001);
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn client_cannot_be_inside_itself() {
+        let client = VaultClient {
+            id: "c1".into(),
+            name: "Rafael".into(),
+            parent_id: "c1".into(),
+            notes: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        assert!(client.validate().is_err());
+
+        let root = VaultClient {
+            parent_id: String::new(),
+            ..client.clone()
+        };
+        assert!(root.validate().is_ok());
+
+        let child = VaultClient {
+            parent_id: "outro".into(),
+            ..client
+        };
+        assert!(child.validate().is_ok());
     }
 
     #[test]

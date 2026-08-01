@@ -127,6 +127,7 @@ mod tests {
             clients: vec![VaultClient {
                 id: "client-1".into(),
                 name: "Cliente".into(),
+                parent_id: String::new(),
                 notes: String::new(),
                 created_at: String::new(),
                 updated_at: String::new(),
