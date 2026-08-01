@@ -424,6 +424,25 @@
                 </div>
               </section>
 
+              <section class="settings-card">
+                <div class="settings-copy">
+                  <h2>Atualizações</h2>
+                  <p>O Noast busca novas versões sozinho e avisa quando encontra.</p>
+                </div>
+                <div class="settings-controls">
+                  <div class="update-row">
+                    <span>
+                      <strong>Versão instalada</strong>
+                      <small id="appVersion">—</small>
+                    </span>
+                    <button id="checkUpdate" class="button secondary" type="button">
+                      Verificar agora
+                    </button>
+                  </div>
+                  <p id="updateStatus" class="field-hint" role="status"></p>
+                </div>
+              </section>
+
               <div class="settings-footer">
                 <span id="settingsStatus" role="status"></span>
                 <button class="button primary" type="submit">Salvar configurações</button>
@@ -645,6 +664,20 @@
           <button id="confirmDialogConfirm" class="button danger-button" type="button">Excluir</button>
         </div>
       </div>
+    </div>
+
+    <div id="updateBanner" class="update-banner" role="status" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 3v12m0 0 4-4m-4 4-4-4" />
+        <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+      </svg>
+      <span id="updateBannerText">Nova versão disponível</span>
+      <button id="updateBannerAction" class="button primary" type="button">
+        Atualizar e reiniciar
+      </button>
+      <button id="updateBannerDismiss" class="icon-button" type="button" aria-label="Agora não">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" /></svg>
+      </button>
     </div>
 
     <div id="snackbar" class="snackbar" role="status" aria-live="polite" hidden>

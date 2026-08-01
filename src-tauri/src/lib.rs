@@ -1388,6 +1388,63 @@ fn start_scheduler(app: AppHandle, state: NotificationState, paths: Paths) {
     });
 }
 
+/// Verifica se há versão nova e devolve o número dela, ou `None` se o app já
+/// está atualizado. Usado pelo botão "Verificar atualizações".
+#[cfg(desktop)]
+#[tauri::command]
+async fn check_for_update(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app.updater().map_err(|error| error.to_string())?;
+    match updater.check().await {
+        Ok(Some(update)) => {
+            log(&app, &format!("Atualização disponível: {}.", update.version));
+            Ok(Some(update.version))
+        }
+        Ok(None) => {
+            log(&app, "Atualização: já está na versão mais recente.");
+            Ok(None)
+        }
+        Err(error) => {
+            log(&app, &format!("Atualização: falha ao verificar: {error}"));
+            Err(format!("Não foi possível verificar atualizações: {error}"))
+        }
+    }
+}
+
+/// Baixa e instala a atualização, reiniciando o app em seguida. Pedido
+/// explícito do usuário, então não passa pelas guardas do check automático.
+#[cfg(desktop)]
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app.updater().map_err(|error| error.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|error| format!("Não foi possível verificar atualizações: {error}"))?
+        .ok_or_else(|| "O Noast já está atualizado.".to_string())?;
+
+    log(&app, &format!("Instalando atualização {}...", update.version));
+    update
+        .download_and_install(|_chunk, _total| {}, || {})
+        .await
+        .map_err(|error| {
+            log(&app, &format!("Atualização: falha ao instalar: {error}"));
+            format!("Não foi possível instalar a atualização: {error}")
+        })?;
+
+    log(&app, "Atualização instalada; reiniciando o Noast.");
+    app.restart();
+}
+
+/// Versão em execução, para exibir nas configurações.
+#[tauri::command]
+fn app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
 /// Instalar reinicia o aplicativo, então só é aceitável quando o usuário não
 /// está no meio de algo: sem alertas na fila e com a janela principal fechada
 /// (o uso normal é pela bandeja). Caso contrário, a atualização espera a
@@ -1448,6 +1505,11 @@ fn start_update_check(app: AppHandle) {
                         return false;
                     }
                 };
+
+                // Avisa a janela principal de qualquer forma: assim o usuário vê
+                // que há versão nova e pode atualizar na hora, sem esperar o
+                // momento seguro nem descobrir pelo log.
+                let _ = app.emit("update-available", update.version.clone());
 
                 if let Err(reason) = safe_to_install_update(&app) {
                     log(
@@ -1684,6 +1746,9 @@ pub fn run() {
             get_custom_snooze_target,
             hide_custom_snooze,
             reschedule_notification,
+            app_version,
+            check_for_update,
+            install_update,
         ])
         .build(tauri::generate_context!())
         .expect("erro ao iniciar Noast")

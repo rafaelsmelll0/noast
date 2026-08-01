@@ -2066,6 +2066,73 @@ h1 {
   font-weight: 500;
 }
 
+.update-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.update-row span {
+  display: grid;
+  gap: 2px;
+}
+
+.update-row strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.update-row small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* Aviso de nova versão: fica acima do snackbar e some só por ação do usuário. */
+.update-banner {
+  position: fixed;
+  z-index: 31;
+  right: 24px;
+  bottom: 24px;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  max-width: min(430px, calc(100vw - 48px));
+  padding: 12px 12px 12px 15px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow);
+  animation: snackbar-in 160ms ease-out;
+}
+
+.update-banner[hidden] {
+  display: none;
+}
+
+.update-banner > svg {
+  width: 19px;
+  height: 19px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: var(--accent-strong, var(--accent));
+  stroke-linecap: round;
+  stroke-width: 2;
+}
+
+#updateBannerText {
+  flex: 1;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.update-banner .button {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+
 /* Cofre: agrupamento de clientes por responsável */
 .vault-group {
   display: grid;

@@ -65,6 +65,13 @@ const elements = {
   whenHint: document.querySelector("#whenHint"),
   weekdayField: document.querySelector("#weekdayField"),
   weekdayPicker: document.querySelector("#weekdayPicker"),
+  appVersion: document.querySelector("#appVersion"),
+  checkUpdate: document.querySelector("#checkUpdate"),
+  updateStatus: document.querySelector("#updateStatus"),
+  updateBanner: document.querySelector("#updateBanner"),
+  updateBannerText: document.querySelector("#updateBannerText"),
+  updateBannerAction: document.querySelector("#updateBannerAction"),
+  updateBannerDismiss: document.querySelector("#updateBannerDismiss"),
 };
 
 function errorMessage(error) {
@@ -601,6 +608,50 @@ function selectView(view) {
   if (view === "vault") vaultController.activate();
 }
 
+function showUpdateBanner(version) {
+  elements.updateBannerText.textContent = `Noast ${version} disponível`;
+  elements.updateBanner.hidden = false;
+}
+
+async function installUpdate() {
+  elements.updateBannerAction.disabled = true;
+  elements.updateBannerText.textContent = "Baixando atualização...";
+  try {
+    // Em caso de sucesso o app reinicia, então nada depois disto roda.
+    await invoke("install_update");
+  } catch (error) {
+    elements.updateBannerAction.disabled = false;
+    elements.updateBanner.hidden = true;
+    showSnackbar(errorMessage(error));
+  }
+}
+
+async function checkForUpdate() {
+  elements.checkUpdate.disabled = true;
+  elements.updateStatus.textContent = "Procurando...";
+  try {
+    const version = await invoke("check_for_update");
+    if (version) {
+      elements.updateStatus.textContent = `Versão ${version} disponível.`;
+      showUpdateBanner(version);
+    } else {
+      elements.updateStatus.textContent = "Você já está na versão mais recente.";
+    }
+  } catch (error) {
+    elements.updateStatus.textContent = errorMessage(error);
+  } finally {
+    elements.checkUpdate.disabled = false;
+  }
+}
+
+async function loadAppVersion() {
+  try {
+    elements.appVersion.textContent = await invoke("app_version");
+  } catch {
+    elements.appVersion.textContent = "desconhecida";
+  }
+}
+
 const confirmDialog = createConfirmDialog();
 const notesController = createNotesController({
   invoke,
@@ -732,12 +783,20 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+elements.checkUpdate.addEventListener("click", checkForUpdate);
+elements.updateBannerAction.addEventListener("click", installUpdate);
+elements.updateBannerDismiss.addEventListener("click", () => {
+  elements.updateBanner.hidden = true;
+});
+
 await Promise.all([
   loadNotifications(),
   loadSettings(),
+  loadAppVersion(),
   notesController.load(),
   vaultController.load(),
 ]);
+await listen("update-available", (event) => showUpdateBanner(event.payload));
 await listen("notifications-changed", loadNotifications);
 await listen("open-new-reminder", () => {
   selectView("reminders");
