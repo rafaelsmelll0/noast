@@ -1,6 +1,6 @@
 [package]
 name = "noast"
-version = "0.6.2"
+version = "0.7.0"
 description = "Noast - lembretes pessoais"
 authors = ["Rafael"]
 edition = "2021"

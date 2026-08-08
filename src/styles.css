@@ -2001,6 +2001,16 @@ h1 {
   animation: modal-in 160ms ease-out;
 }
 
+/* O modal de acesso rola por dentro (.vault-access-scroll, com barra própria e
+   padding próprio). As regras de .modal acima vêm depois no arquivo e têm a
+   mesma especificidade, então sobrescreviam estas três — o que somava um
+   segundo scroll (duas barras) e um padding extra ao redor do conteúdo. */
+.modal.vault-access-modal {
+  max-height: calc(100vh - 90px);
+  padding: 0;
+  overflow: hidden;
+}
+
 .modal-header {
   display: flex;
   align-items: flex-start;
@@ -2071,6 +2081,28 @@ h1 {
   color: var(--muted);
   font-size: 11px;
   font-weight: 500;
+}
+
+.field-with-action {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.field-with-action select {
+  min-width: 0;
+  flex: 1;
+}
+
+.field-with-action .button {
+  flex: 0 0 auto;
+  padding: 9px 12px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.new-client-input {
+  margin-top: 8px;
 }
 
 .update-row {

@@ -281,7 +281,7 @@
               <aside class="vault-clients-pane" aria-label="Clientes do cofre">
                 <label class="search vault-search">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></svg>
-                  <input id="vaultSearchInput" type="search" placeholder="Buscar no cofre" autocomplete="off" />
+                  <input id="vaultSearchInput" type="search" placeholder="Buscar cliente ou acesso" autocomplete="off" />
                 </label>
                 <div id="vaultClientList" class="vault-client-list" aria-live="polite"></div>
                 <div id="vaultClientListEmpty" class="vault-list-empty" hidden>
@@ -573,6 +573,24 @@
             </button>
           </div>
           <form id="vaultAccessForm" class="vault-form">
+            <div class="form-field">
+              <span>Cliente</span>
+              <div class="field-with-action">
+                <select id="vaultAccessClient"></select>
+                <button id="vaultAccessNewClient" class="button secondary" type="button">
+                  Novo cliente
+                </button>
+              </div>
+              <input
+                id="vaultAccessNewClientName"
+                class="new-client-input"
+                type="text"
+                maxlength="120"
+                placeholder="Nome do novo cliente"
+                autocomplete="off"
+                hidden
+              />
+            </div>
             <div class="form-grid">
               <label class="form-field">
                 <span>Nome do acesso</span>

@@ -99,6 +99,9 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     accessScrollbarThumb: document.querySelector("#vaultAccessScrollbarThumb"),
     accessModalTitle: document.querySelector("#vaultAccessModalTitle"),
     accessForm: document.querySelector("#vaultAccessForm"),
+    accessClient: document.querySelector("#vaultAccessClient"),
+    accessNewClient: document.querySelector("#vaultAccessNewClient"),
+    accessNewClientName: document.querySelector("#vaultAccessNewClientName"),
     accessLabel: document.querySelector("#vaultAccessLabel"),
     accessService: document.querySelector("#vaultAccessService"),
     accessCustomService: document.querySelector("#vaultAccessCustomService"),
@@ -350,6 +353,11 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
 
   async function saveClient(event) {
     event.preventDefault();
+    // Cada entrada gera um id novo: sem esta guarda, um clique duplo cadastra
+    // o mesmo cliente duas vezes.
+    const submitButton = elements.clientForm.querySelector('button[type="submit"]');
+    if (submitButton.disabled) return;
+
     const name = elements.clientNameInput.value.trim();
     if (!name) {
       elements.clientError.textContent = "Informe o nome do cliente.";
@@ -364,6 +372,7 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       created_at: current?.created_at ?? "",
       updated_at: current?.updated_at ?? "",
     };
+    submitButton.disabled = true;
     try {
       const saved = await invoke("save_vault_client", { client });
       const index = state.clients.findIndex((item) => item.id === saved.id);
@@ -374,6 +383,8 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       showSnackbar(current ? "Cliente atualizado." : "Cliente cadastrado.");
     } catch (error) {
       elements.clientError.textContent = normalizedError(error, "Não foi possível salvar o cliente.");
+    } finally {
+      submitButton.disabled = false;
     }
   }
 
@@ -465,6 +476,34 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     updateAccessScrollbar();
   }
 
+  /// Lista os clientes no seletor do acesso, com o responsável no rótulo para
+  /// diferenciar homônimos ("Dora" em dois grupos distintos).
+  function fillAccessClientOptions(selectedId) {
+    const label = (client) => {
+      const parent = client.parent_id
+        ? state.clients.find((item) => item.id === client.parent_id)
+        : null;
+      return parent ? `${parent.name} › ${client.name}` : client.name;
+    };
+    const options = [...state.clients]
+      .sort((a, b) => label(a).localeCompare(label(b), "pt-BR"))
+      .map(
+        (client) =>
+          `<option value="${escapeHtml(client.id)}">${escapeHtml(label(client))}</option>`,
+      )
+      .join("");
+    elements.accessClient.innerHTML = options;
+    if (selectedId) elements.accessClient.value = selectedId;
+    hideNewClientField();
+  }
+
+  function hideNewClientField() {
+    elements.accessNewClientName.hidden = true;
+    elements.accessNewClientName.value = "";
+    elements.accessClient.disabled = false;
+    elements.accessNewClient.textContent = "Novo cliente";
+  }
+
   async function openAccessModal(accessId = null) {
     const client = selectedClient();
     if (!client) return;
@@ -474,10 +513,12 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     elements.accessError.textContent = "";
     setPasswordVisibility(false);
     setServiceValue("");
+    fillAccessClientOptions(client.id);
 
     if (accessId) {
       try {
         const access = await invoke("get_vault_access", { id: accessId });
+        fillAccessClientOptions(access.client_id);
         elements.accessLabel.value = access.label;
         setServiceValue(access.service);
         elements.accessUrl.value = access.url;
@@ -499,6 +540,11 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
 
   async function saveAccess(event) {
     event.preventDefault();
+    // Mesma proteção do cliente: sem ela, um clique duplo grava duas cópias da
+    // credencial (com ids diferentes).
+    const submitButton = elements.accessForm.querySelector('button[type="submit"]');
+    if (submitButton.disabled) return;
+
     const client = selectedClient();
     if (!client) return;
     const label = elements.accessLabel.value.trim();
@@ -515,9 +561,46 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
         return;
       }
     }
+    // Cliente escolhido no próprio formulário: permite mover um acesso de um
+    // cliente para outro sem recriá-lo, e criar o cliente aqui mesmo.
+    let clientId = elements.accessClient.value;
+    const newClientName = elements.accessNewClientName.hidden
+      ? ""
+      : elements.accessNewClientName.value.trim();
+    if (!elements.accessNewClientName.hidden) {
+      if (!newClientName) {
+        elements.accessError.textContent = "Informe o nome do novo cliente.";
+        return;
+      }
+      try {
+        const created = await invoke("save_vault_client", {
+          client: {
+            id: crypto.randomUUID(),
+            name: newClientName,
+            parent_id: "",
+            notes: "",
+            created_at: "",
+            updated_at: "",
+          },
+        });
+        state.clients.push(created);
+        clientId = created.id;
+      } catch (error) {
+        elements.accessError.textContent = normalizedError(
+          error,
+          "Não foi possível criar o cliente.",
+        );
+        return;
+      }
+    }
+    if (!clientId) {
+      elements.accessError.textContent = "Escolha o cliente deste acesso.";
+      return;
+    }
+
     const access = {
       id: current?.id ?? crypto.randomUUID(),
-      client_id: client.id,
+      client_id: clientId,
       label,
       service: selectedServiceValue(),
       url: elements.accessUrl.value.trim(),
@@ -528,16 +611,28 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       created_at: current?.created_at ?? "",
       updated_at: current?.updated_at ?? "",
     };
+    submitButton.disabled = true;
     try {
       const saved = await invoke("save_vault_access", { access });
       const index = state.accesses.findIndex((item) => item.id === saved.id);
       if (index >= 0) state.accesses[index] = saved;
       else state.accesses.push(saved);
       closeAccessModal();
-      render();
-      showSnackbar(current ? "Acesso atualizado." : "Acesso protegido no cofre.");
+      // Segue o acesso se ele mudou de dono, senão ele "sumiria" da tela.
+      if (saved.client_id !== state.selectedClientId) selectClient(saved.client_id);
+      else render();
+      const movedTo = state.clients.find((item) => item.id === saved.client_id);
+      showSnackbar(
+        current
+          ? saved.client_id !== client.id
+            ? `Acesso movido para ${movedTo?.name ?? "outro cliente"}.`
+            : "Acesso atualizado."
+          : "Acesso protegido no cofre.",
+      );
     } catch (error) {
       elements.accessError.textContent = normalizedError(error, "Não foi possível salvar o acesso.");
+    } finally {
+      submitButton.disabled = false;
     }
   }
 
@@ -679,6 +774,16 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       state.selectedClientId = visible[0]?.id ?? null;
     }
     render();
+  });
+
+  // Cria o cliente sem sair do cadastro do acesso: o campo de nome aparece no
+  // lugar da escolha e o cliente é criado junto ao salvar.
+  elements.accessNewClient.addEventListener("click", () => {
+    const creating = elements.accessNewClientName.hidden;
+    elements.accessNewClientName.hidden = !creating;
+    elements.accessClient.disabled = creating;
+    elements.accessNewClient.textContent = creating ? "Escolher existente" : "Novo cliente";
+    if (creating) elements.accessNewClientName.focus();
   });
 
   elements.list.addEventListener("click", (event) => {
