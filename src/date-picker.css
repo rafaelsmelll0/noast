@@ -1,0 +1,158 @@
+/* Calendário próprio (substitui o seletor nativo do WebView2) */
+.date-input-hidden {
+  display: none !important;
+}
+
+.date-field {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 11px 12px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+}
+
+.date-field:hover {
+  background: var(--surface-hover);
+}
+
+.date-field:focus-visible {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+.date-field.is-empty .date-field-value {
+  color: var(--muted);
+}
+
+.date-field svg {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.date-popover {
+  position: absolute;
+  z-index: 40;
+  width: 268px;
+  margin-top: 6px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+}
+
+.date-popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.date-popover-header strong {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+
+.date-nav {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  background: transparent;
+  border-radius: 8px;
+  color: var(--muted);
+}
+
+.date-nav:hover {
+  background: var(--surface-hover);
+  color: var(--ink);
+}
+
+.date-nav svg {
+  width: 15px;
+  height: 15px;
+}
+
+.date-weekdays,
+.date-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+}
+
+.date-weekdays span {
+  padding-bottom: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.date-day {
+  aspect-ratio: 1;
+  background: transparent;
+  border-radius: 8px;
+  color: var(--body);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.date-day:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--ink);
+}
+
+.date-day.is-outside {
+  color: color-mix(in srgb, var(--muted) 55%, transparent);
+}
+
+.date-day:disabled {
+  color: color-mix(in srgb, var(--muted) 40%, transparent);
+  cursor: not-allowed;
+}
+
+/* O dia de hoje ganha um anel; o selecionado, preenchimento cheio. */
+.date-day.is-today {
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+  color: var(--accent-strong);
+}
+
+.date-day.is-selected {
+  background: var(--ink);
+  box-shadow: none;
+  color: var(--surface);
+}
+
+.date-popover-footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.date-today {
+  padding: 6px 10px;
+  background: transparent;
+  border-radius: 8px;
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.date-today:hover {
+  background: var(--surface-hover);
+}

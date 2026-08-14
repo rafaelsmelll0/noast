@@ -1,4 +1,5 @@
 import { createConfirmDialog } from "./confirm-dialog.js";
+import { attachDatePicker } from "./date-picker.js";
 import { createNotesController } from "./notes.js";
 import { createVaultController } from "./vault.js";
 
@@ -782,6 +783,8 @@ document.addEventListener("keydown", (event) => {
     }
   }
 });
+
+attachDatePicker(elements.date);
 
 elements.checkUpdate.addEventListener("click", checkForUpdate);
 elements.updateBannerAction.addEventListener("click", installUpdate);

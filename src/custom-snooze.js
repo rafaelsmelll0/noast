@@ -1,3 +1,5 @@
+import { attachDatePicker } from "./date-picker.js";
+
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
@@ -57,6 +59,7 @@ async function init() {
   }
   await listen("settings-changed", (event) => applyTheme(event.payload.theme));
   await listen("custom-snooze-open", reset);
+  attachDatePicker(dateInput);
   reset();
 }
 

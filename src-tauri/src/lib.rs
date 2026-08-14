@@ -807,8 +807,8 @@ fn open_custom_snooze(
     id: String,
     anchor: SnoozeMenuAnchor,
 ) -> Result<bool, String> {
-    const WIDTH: f64 = 248.0;
-    const HEIGHT: f64 = 208.0;
+    const WIDTH: f64 = 300.0;
+    const HEIGHT: f64 = 430.0;
     const GAP: f64 = 6.0;
 
     let toast = app
@@ -1125,7 +1125,7 @@ fn create_custom_snooze_window(
         WebviewUrl::App("custom-snooze.html".into()),
     )
     .title("")
-    .inner_size(248.0, 208.0)
+    .inner_size(300.0, 430.0)
     .resizable(false)
     .decorations(false)
     .transparent(true)

@@ -1861,6 +1861,7 @@ h1 {
 
 .control-field,
 .form-field {
+  position: relative;
   display: grid;
   gap: 7px;
   color: var(--body);
