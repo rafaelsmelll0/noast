@@ -324,6 +324,7 @@
                     </div>
                   </header>
                   <p id="vaultClientNotes" class="vault-client-notes" hidden></p>
+                  <div id="vaultFolders" class="vault-folders" role="tablist" aria-label="Pastas do cliente" hidden></div>
                   <div id="vaultAccessList" class="vault-access-list" aria-live="polite"></div>
                   <div id="vaultAccessEmpty" class="vault-access-empty" hidden>
                     <h3>Nenhum acesso neste cliente</h3>
@@ -592,6 +593,18 @@
                 hidden
               />
             </div>
+            <label class="form-field">
+              <span>Pasta <small class="label-optional">(opcional)</small></span>
+              <input
+                id="vaultAccessFolder"
+                type="text"
+                maxlength="120"
+                placeholder="Ex.: Dora — agrupa os acessos dela"
+                autocomplete="off"
+                list="vaultFolderOptions"
+              />
+              <datalist id="vaultFolderOptions"></datalist>
+            </label>
             <div class="form-grid">
               <label class="form-field">
                 <span>Nome do acesso</span>

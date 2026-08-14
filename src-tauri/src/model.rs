@@ -69,6 +69,11 @@ pub struct VaultAccess {
     pub id: String,
     pub client_id: String,
     pub label: String,
+    /// Agrupa acessos dentro do cliente, como uma pasta — ex.: as credenciais
+    /// da "Dora" (cPanel e Registro.br) dentro do cliente "Mobtus". Vazio
+    /// deixa o acesso solto na raiz do cliente.
+    #[serde(default)]
+    pub folder: String,
     #[serde(default)]
     pub service: String,
     #[serde(default)]
@@ -98,6 +103,9 @@ impl VaultAccess {
         if self.label.chars().count() > 120 || self.service.chars().count() > 80 {
             return Err("O nome ou tipo do acesso é muito longo.".to_string());
         }
+        if self.folder.chars().count() > 120 {
+            return Err("O nome da pasta deve ter no máximo 120 caracteres.".to_string());
+        }
         if self.url.chars().count() > 2_000
             || self.username.chars().count() > 500
             || self.password.chars().count() > 2_000
@@ -115,6 +123,7 @@ pub struct VaultAccessSummary {
     pub id: String,
     pub client_id: String,
     pub label: String,
+    pub folder: String,
     pub service: String,
     pub url: String,
     pub username: String,
@@ -128,6 +137,7 @@ impl From<&VaultAccess> for VaultAccessSummary {
             id: access.id.clone(),
             client_id: access.client_id.clone(),
             label: access.label.clone(),
+            folder: access.folder.clone(),
             service: access.service.clone(),
             url: access.url.clone(),
             username: access.username.clone(),
@@ -364,6 +374,7 @@ mod tests {
                 id: "access-1".into(),
                 client_id: "client-1".into(),
                 label: "Painel".into(),
+                folder: String::new(),
                 service: "cPanel".into(),
                 url: String::new(),
                 username: "rafael".into(),

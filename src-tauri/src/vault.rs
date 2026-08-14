@@ -136,6 +136,7 @@ mod tests {
                 id: "access-1".into(),
                 client_id: "client-1".into(),
                 label: "Login".into(),
+                folder: String::new(),
                 service: "E-mail".into(),
                 url: String::new(),
                 username: "usuario".into(),

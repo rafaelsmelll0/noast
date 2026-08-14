@@ -70,6 +70,9 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     clipboardVersion: 0,
     revealTimers: new Map(),
     collapsedGroups: new Set(),
+    // null = mostrar todos os acessos do cliente; "" = os que estão fora de
+    // qualquer pasta; texto = o nome da pasta escolhida.
+    selectedFolder: null,
   };
 
   const elements = {
@@ -84,6 +87,9 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     clientSummary: document.querySelector("#vaultClientSummary"),
     clientNotes: document.querySelector("#vaultClientNotes"),
     accessList: document.querySelector("#vaultAccessList"),
+    folders: document.querySelector("#vaultFolders"),
+    accessFolder: document.querySelector("#vaultAccessFolder"),
+    folderOptions: document.querySelector("#vaultFolderOptions"),
     accessEmpty: document.querySelector("#vaultAccessEmpty"),
     clientModal: document.querySelector("#vaultClientModal"),
     clientModalTitle: document.querySelector("#vaultClientModalTitle"),
@@ -124,7 +130,7 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       .sort((a, b) => a.label.localeCompare(b.label, "pt-BR"));
 
   function accessMatches(access, query) {
-    return `${access.label}\n${access.service}\n${access.url}\n${access.username}`
+    return `${access.label}\n${access.folder ?? ""}\n${access.service}\n${access.url}\n${access.username}`
       .toLocaleLowerCase("pt-BR")
       .includes(query);
   }
@@ -224,7 +230,16 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
         <header class="vault-card-header">
           <div class="vault-card-title">
             <h3>${escapeHtml(access.label)}</h3>
-            <span class="vault-service-badge">${escapeHtml(service)}</span>
+            <span class="vault-badges">
+              <span class="vault-service-badge">${escapeHtml(service)}</span>
+              ${
+                // Vendo "Todos", a pasta diz de quem é o acesso — dentro de uma
+                // pasta seria repetição.
+                access.folder && state.selectedFolder === null
+                  ? `<span class="vault-folder-badge"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>${escapeHtml(access.folder)}</span>`
+                  : ""
+              }
+            </span>
           </div>
           <div class="vault-card-menu">
             ${
@@ -262,6 +277,52 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       </article>`;
   }
 
+  /// Pastas existentes no cliente, na ordem em que serão exibidas. São
+  /// derivadas dos próprios acessos: criar uma pasta é só digitar o nome ao
+  /// salvar um acesso, e ela some sozinha quando o último acesso sai dela.
+  function foldersOf(accesses) {
+    const counts = new Map();
+    for (const access of accesses) {
+      const name = access.folder || "";
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    const named = [...counts.entries()]
+      .filter(([name]) => name)
+      .sort((a, b) => a[0].localeCompare(b[0], "pt-BR"));
+    const loose = counts.get("") ?? 0;
+    return { named, loose, total: accesses.length };
+  }
+
+  function folderButton(label, value, count, icon = true) {
+    // "Todos" é representado por null no estado, mas precisa de um valor no DOM.
+    const current = state.selectedFolder === null ? "__all__" : state.selectedFolder;
+    const active = current === value ? " active" : "";
+    const folderIcon = icon
+      ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>'
+      : "";
+    return `<button class="vault-folder${active}" type="button" data-folder="${escapeHtml(String(value))}" role="tab" aria-selected="${Boolean(active)}">
+      ${folderIcon}<span>${escapeHtml(label)}</span><span class="vault-folder-count">${count}</span>
+    </button>`;
+  }
+
+  function renderFolders(client, accesses) {
+    const { named, loose, total } = foldersOf(accesses);
+    // Sem nenhuma pasta criada, a barra não aparece — quem não usa o recurso
+    // não ganha uma linha a mais na tela.
+    if (named.length === 0) {
+      elements.folders.hidden = true;
+      elements.folders.innerHTML = "";
+      state.selectedFolder = null;
+      return;
+    }
+    elements.folders.hidden = false;
+    elements.folders.innerHTML = [
+      folderButton("Todos", "__all__", total, false),
+      ...named.map(([name, count]) => folderButton(name, name, count)),
+      loose ? folderButton("Sem pasta", "", loose, false) : "",
+    ].join("");
+  }
+
   function renderSelectedClient() {
     const client = selectedClient();
     elements.empty.hidden = Boolean(client);
@@ -269,9 +330,14 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     if (!client) return;
 
     const allAccesses = clientAccesses(client.id);
-    const accesses = state.query
+    const searched = state.query
       ? allAccesses.filter((access) => accessMatches(access, state.query))
       : allAccesses;
+    renderFolders(client, searched);
+    const accesses =
+      state.selectedFolder === null
+        ? searched
+        : searched.filter((access) => (access.folder || "") === state.selectedFolder);
     elements.clientName.textContent = client.name;
     elements.clientAvatar.textContent = initials(client.name);
     // Deixa claro de quem é o cliente aberto, ou quantos ele agrupa.
@@ -306,7 +372,11 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
   }
 
   function selectClient(id) {
+    const changed = id !== state.selectedClientId;
     state.selectedClientId = state.clients.some((client) => client.id === id) ? id : null;
+    // As pastas são de cada cliente: manter o filtro ao trocar esconderia
+    // acessos sem motivo aparente.
+    if (changed) state.selectedFolder = null;
     render();
   }
 
@@ -497,6 +567,17 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     hideNewClientField();
   }
 
+  /// Sugere as pastas já usadas em todo o cofre — inclusive as de outros
+  /// clientes, porque o mesmo nome costuma se repetir entre eles.
+  function fillFolderSuggestions() {
+    const names = [...new Set(state.accesses.map((access) => access.folder).filter(Boolean))].sort(
+      (a, b) => a.localeCompare(b, "pt-BR"),
+    );
+    elements.folderOptions.innerHTML = names
+      .map((name) => `<option value="${escapeHtml(name)}"></option>`)
+      .join("");
+  }
+
   function hideNewClientField() {
     elements.accessNewClientName.hidden = true;
     elements.accessNewClientName.value = "";
@@ -514,11 +595,15 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     setPasswordVisibility(false);
     setServiceValue("");
     fillAccessClientOptions(client.id);
+    fillFolderSuggestions();
+    // Criar um acesso com uma pasta aberta já entra nela.
+    elements.accessFolder.value = accessId ? "" : (state.selectedFolder ?? "");
 
     if (accessId) {
       try {
         const access = await invoke("get_vault_access", { id: accessId });
         fillAccessClientOptions(access.client_id);
+        elements.accessFolder.value = access.folder ?? "";
         elements.accessLabel.value = access.label;
         setServiceValue(access.service);
         elements.accessUrl.value = access.url;
@@ -601,6 +686,7 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     const access = {
       id: current?.id ?? crypto.randomUUID(),
       client_id: clientId,
+      folder: elements.accessFolder.value.trim(),
       label,
       service: selectedServiceValue(),
       url: elements.accessUrl.value.trim(),
@@ -797,6 +883,14 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     }
     const item = event.target.closest("[data-vault-client]");
     if (item) selectClient(item.dataset.vaultClient);
+  });
+
+  elements.folders.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-folder]");
+    if (!button) return;
+    const value = button.dataset.folder;
+    state.selectedFolder = value === "__all__" ? null : value;
+    renderSelectedClient();
   });
 
   elements.accessList.addEventListener("click", async (event) => {

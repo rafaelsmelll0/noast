@@ -2084,6 +2084,90 @@ h1 {
   font-weight: 500;
 }
 
+.label-optional {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+/* Pastas do cliente: filtram os acessos exibidos */
+.vault-folders {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+
+.vault-folder {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--body);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.vault-folder:hover {
+  background: var(--surface-hover);
+  color: var(--ink);
+}
+
+.vault-folder svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  color: var(--accent-strong);
+}
+
+.vault-folder.active {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--surface);
+}
+
+.vault-folder.active svg {
+  color: var(--surface);
+}
+
+.vault-folder-count {
+  color: inherit;
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.vault-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
+.vault-folder-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.vault-folder-badge svg {
+  width: 11px;
+  height: 11px;
+  color: var(--accent-strong);
+}
+
 .field-with-action {
   display: flex;
   gap: 8px;
