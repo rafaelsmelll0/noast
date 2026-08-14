@@ -201,10 +201,28 @@ export function attachDatePicker(input) {
     }
   });
 
-  // Mudanças feitas por código (atalhos "Amanhã 9h", dia da semana) precisam
-  // refletir no rótulo.
   input.addEventListener("change", syncFieldLabel);
   input.addEventListener("input", syncFieldLabel);
+
+  // Atribuir `input.value` por código (data inicial ao abrir o formulário,
+  // atalhos "Amanhã 9h", seletor de dia da semana) não dispara evento algum —
+  // o rótulo ficaria preso em "Escolher data" com o campo já preenchido.
+  // Interceptar o setter mantém o componente transparente para quem o usa.
+  const valueProperty = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+  Object.defineProperty(input, "value", {
+    configurable: true,
+    get() {
+      return valueProperty.get.call(this);
+    },
+    set(next) {
+      valueProperty.set.call(this, next);
+      syncFieldLabel();
+    },
+  });
+
+  // form.reset() limpa o campo por dentro, sem passar pelo setter acima.
+  // O atraso deixa o navegador aplicar o reset antes de reler o valor.
+  input.form?.addEventListener("reset", () => window.setTimeout(syncFieldLabel, 0));
 
   syncFieldLabel();
 }
