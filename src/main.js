@@ -1,7 +1,7 @@
 import { createConfirmDialog } from "./confirm-dialog.js";
 import { attachDatePicker } from "./date-picker.js";
 import { createNotesController } from "./notes.js";
-import { createVaultController } from "./vault.js";
+import { createVaultController, requestCloseVaultForms } from "./vault.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -18,6 +18,15 @@ const state = {
   query: "",
   activeView: "reminders",
   editingId: null,
+  // Lembrete como estava ao abrir o formulário de edição (atualizado quando o
+  // backend avisa de mudanças) e os valores de data/hora que o formulário
+  // recebeu — comparar com eles diz se o usuário mexeu nos campos.
+  editingSnapshot: null,
+  editingOpenedDone: false,
+  formBaseline: null,
+  loadSeq: 0,
+  lastGroupsHtml: null,
+  settingsLoaded: false,
   snackbarTimer: null,
 };
 
@@ -59,11 +68,14 @@ const elements = {
   formError: document.querySelector("#formError"),
   settingsForm: document.querySelector("#settingsForm"),
   settingsStatus: document.querySelector("#settingsStatus"),
+  settingsRetry: document.querySelector("#settingsRetry"),
+  snoozeSetting: document.querySelector("#snoozeSetting"),
   snackbar: document.querySelector("#snackbar"),
   snackbarText: document.querySelector("#snackbarText"),
   snackbarAction: document.querySelector("#snackbarAction"),
   quickWhen: document.querySelector("#quickWhen"),
   whenHint: document.querySelector("#whenHint"),
+  editHint: document.querySelector("#editHint"),
   weekdayField: document.querySelector("#weekdayField"),
   weekdayPicker: document.querySelector("#weekdayPicker"),
   appVersion: document.querySelector("#appVersion"),
@@ -74,6 +86,10 @@ const elements = {
   updateBannerAction: document.querySelector("#updateBannerAction"),
   updateBannerDismiss: document.querySelector("#updateBannerDismiss"),
 };
+
+// Criado já aqui (e não junto dos outros listeners) porque openModal/closeModal
+// o usam e podem rodar cedo, pelo evento "open-new-reminder" da bandeja.
+const reminderPicker = attachDatePicker(elements.date);
 
 function errorMessage(error) {
   if (typeof error === "string") return error;
@@ -157,6 +173,9 @@ function temporalGroup(notification, now) {
 
 function formatDateTime(value) {
   const datetime = parseDateTime(value);
+  // Data inválida (arquivo editado à mão): Intl.DateTimeFormat lança
+  // RangeError, e um único cartão assim escondia a lista inteira.
+  if (Number.isNaN(datetime.getTime())) return `Data inválida (${value})`;
   const now = new Date();
   const today = startOfDay(now);
   const target = startOfDay(datetime);
@@ -277,6 +296,7 @@ function render() {
   updateCounts();
   const notifications = filteredNotifications();
   if (notifications.length === 0) {
+    state.lastGroupsHtml = null;
     renderEmpty();
     return;
   }
@@ -290,7 +310,7 @@ function render() {
     groups.get(group.key).notifications.push(notification);
   }
 
-  elements.groups.innerHTML = [...groups.values()]
+  const html = [...groups.values()]
     .sort((a, b) => a.order - b.order)
     .map(
       (group) => `
@@ -302,15 +322,45 @@ function render() {
         </section>`,
     )
     .join("");
+  // A lista é redesenhada a cada minuto; sem mudança real, manter o DOM evita
+  // tirar o foco do cartão que o usuário estava navegando pelo teclado.
+  if (html === state.lastGroupsHtml) return;
+  state.lastGroupsHtml = html;
+  elements.groups.innerHTML = html;
 }
 
 async function loadNotifications() {
+  // Eventos em sequência (ex.: disparo + adiamento) fazem buscas se
+  // sobreporem; só a mais recente pode escrever no estado.
+  const seq = ++state.loadSeq;
   try {
-    state.notifications = await invoke("get_notifications");
+    const notifications = await invoke("get_notifications");
+    if (seq !== state.loadSeq) return;
+    state.notifications = notifications;
     render();
+    syncEditingForm();
   } catch (error) {
-    showSnackbar(errorMessage(error));
+    if (seq === state.loadSeq) showSnackbar(errorMessage(error));
   }
+}
+
+/// Recalcula os rótulos que dependem do relógio (Hoje/Amanhã, Atrasados,
+/// contagens) sem esperar um evento do backend.
+function refreshTimeLabels() {
+  render();
+  if (!elements.modal.hidden) {
+    updateWhenHint();
+    updateEditHint();
+  }
+}
+
+function scheduleMinuteTick() {
+  // Alinha ao virar do minuto, quando um lembrete passa a "Atrasado".
+  const delay = 60_000 - (Date.now() % 60_000) + 250;
+  window.setTimeout(() => {
+    refreshTimeLabels();
+    scheduleMinuteTick();
+  }, delay);
 }
 
 function localDateParts(date) {
@@ -342,6 +392,8 @@ function applyWeekday(weekday) {
   syncWeekdayPicker();
   clearQuickChips();
   updateWhenHint();
+  // O setter não dispara "input": a dica de série adiada ficaria velha.
+  updateEditHint();
 }
 
 /// Marca o dia correspondente à data atual e mostra/esconde o seletor conforme
@@ -350,9 +402,22 @@ function syncWeekdayPicker() {
   const weekly = WEEKDAY_REPEATS.has(elements.repeat.value);
   elements.weekdayField.hidden = !weekly;
   if (!weekly) return;
-  const current = elements.date.value
+  let current = elements.date.value
     ? new Date(`${elements.date.value}T12:00:00`).getDay()
     : null;
+  // Recorrente adiado, com data/hora ainda as do adiamento: o dia que vale é
+  // o da série (o mesmo que a dica "Adiado — a série continua..." descreve).
+  const editing = state.editingId
+    ? state.notifications.find((item) => item.id === state.editingId)
+    : null;
+  if (
+    editing?.series_datetime &&
+    editing.series_datetime !== editing.datetime &&
+    formDateTimeMatches(editing.datetime)
+  ) {
+    const anchor = parseDateTime(editing.series_datetime);
+    if (!Number.isNaN(anchor.getTime())) current = anchor.getDay();
+  }
   elements.weekdayPicker.querySelectorAll(".weekday").forEach((button) => {
     const active = Number(button.dataset.weekday) === current;
     button.classList.toggle("active", active);
@@ -381,6 +446,7 @@ function applyQuickWhen(chip) {
   clearQuickChips();
   chip.classList.add("active");
   updateWhenHint();
+  updateEditHint();
 }
 
 /// Resume em texto o horário escolhido ("daqui a 2 h 30 min") e avisa quando a
@@ -418,8 +484,135 @@ function updateWhenHint() {
   whenHint.textContent = `Tocará daqui a ${parts.join(" e ")}.`;
 }
 
+const WEEKDAY_NAMES = [
+  "domingo",
+  "segunda-feira",
+  "terça-feira",
+  "quarta-feira",
+  "quinta-feira",
+  "sexta-feira",
+  "sábado",
+];
+
+function formDateTimeMatches(datetime) {
+  return (
+    elements.date.value === datetime.slice(0, 10) &&
+    elements.time.value === datetime.slice(11, 16)
+  );
+}
+
+/// Descreve a série de um lembrete recorrente adiado a partir do horário
+/// oficial (`series_datetime`), que o formulário não mostra: os campos trazem
+/// a data do adiamento.
+function seriesDescription(notification) {
+  const anchor = parseDateTime(notification.series_datetime);
+  if (Number.isNaN(anchor.getTime())) return "";
+  const time = notification.series_datetime.slice(11, 16);
+  const weekday = WEEKDAY_NAMES[anchor.getDay()];
+  const day = String(anchor.getDate()).padStart(2, "0");
+  const month = String(anchor.getMonth() + 1).padStart(2, "0");
+  switch (notification.repeat) {
+    case "daily":
+      return `todos os dias às ${time}`;
+    case "weekly":
+      // "todo sábado/domingo", "toda segunda-feira"...
+      return `${anchor.getDay() % 6 === 0 ? "todo" : "toda"} ${weekday} às ${time}`;
+    case "biweekly":
+      return `a cada 2 semanas (${weekday}) às ${time}`;
+    case "monthly":
+      // series_day guarda o dia pretendido ("todo dia 31" parado em 28/02).
+      return `todo dia ${notification.series_day || anchor.getDate()} às ${time}`;
+    case "yearly":
+      return `todo ${day}/${month} às ${time}`;
+    default:
+      return "";
+  }
+}
+
+/// Dica discreta sob "Quando" no modo edição: lembrete recorrente adiado
+/// (a série segue outro horário), ou mudanças feitas por fora enquanto o
+/// formulário estava aberto. Só informa — não altera o que é salvo.
+function updateEditHint() {
+  const hint = elements.editHint;
+  let message = "";
+  if (state.editingId && state.editingSnapshot) {
+    const current = state.notifications.find((item) => item.id === state.editingId);
+    if (!current) {
+      message = "Este lembrete foi excluído. Salvar vai criá-lo de novo.";
+    } else if (current.done && !state.editingOpenedDone) {
+      message = "Este lembrete foi concluído enquanto você editava.";
+    } else if (
+      current.repeat !== "none" &&
+      current.series_datetime &&
+      current.series_datetime !== current.datetime
+    ) {
+      const series = seriesDescription(current);
+      // Mudar data, hora ou repetição redefine a série no backend.
+      const untouched =
+        formDateTimeMatches(current.datetime) && elements.repeat.value === current.repeat;
+      if (series && untouched) {
+        message = `Adiado — a série continua ${series}.`;
+      } else if (series) {
+        message = "Adiado — ao salvar, a série passa a seguir a nova data e hora.";
+      }
+    }
+  }
+  hint.textContent = message;
+  hint.hidden = !message;
+}
+
+/// O lembrete em edição mudou no backend (adiado/concluído pelo toast,
+/// disparou e avançou para a próxima ocorrência). Se o usuário não mexeu em
+/// data/hora, os campos acompanham o valor novo — senão salvar gravaria o
+/// horário velho por cima do adiamento. Se mexeu, a escolha dele prevalece.
+function syncEditingForm() {
+  if (elements.modal.hidden || !state.editingId || !state.editingSnapshot) return;
+  const current = state.notifications.find((item) => item.id === state.editingId);
+  if (current && current.datetime !== state.editingSnapshot.datetime) {
+    const baseline = state.formBaseline;
+    const untouched =
+      baseline && elements.date.value === baseline.date && elements.time.value === baseline.time;
+    if (untouched) {
+      const date = current.datetime.slice(0, 10);
+      const time = current.datetime.slice(11, 16);
+      elements.date.value = date;
+      elements.time.value = time;
+      state.formBaseline = { date, time };
+      clearQuickChips();
+      syncWeekdayPicker();
+      updateWhenHint();
+    }
+  }
+  if (current) state.editingSnapshot = { ...current };
+  updateEditHint();
+}
+
+function focusModal() {
+  // Algum campo do formulário já com foco: não rouba (o usuário pode estar
+  // digitando a hora quando a bandeja pede "Novo lembrete" de novo).
+  if (elements.form.contains(document.activeElement)) return;
+  elements.text.focus();
+}
+
+/// "Novo lembrete" (Ctrl+N, bandeja). Com o formulário já aberto — novo ou
+/// editando outro lembrete — só o traz para o foco: recomeçar apagaria o que
+/// foi digitado e transformaria uma edição em "Novo".
+async function openNewReminder() {
+  if (!(await selectView("reminders"))) return;
+  if (!elements.modal.hidden) {
+    focusModal();
+    return;
+  }
+  openModal();
+}
+
 function openModal(notification = null, duplicate = false) {
+  reminderPicker?.close();
   state.editingId = notification && !duplicate ? notification.id : null;
+  state.editingSnapshot = state.editingId ? { ...notification } : null;
+  // Abrir um lembrete já concluído não merece aviso; concluir durante a
+  // edição (pelo toast), sim.
+  state.editingOpenedDone = Boolean(state.editingId && notification.done);
   elements.modalTitle.textContent = duplicate
     ? "Duplicar lembrete"
     : notification
@@ -442,19 +635,26 @@ function openModal(notification = null, duplicate = false) {
     elements.repeat.value = "none";
   }
 
+  state.formBaseline = { date: elements.date.value, time: elements.time.value };
+
   updateCharacterCount();
   clearQuickChips();
   syncWeekdayPicker();
   updateWhenHint();
+  updateEditHint();
   elements.modal.hidden = false;
   window.setTimeout(() => elements.text.focus(), 80);
 }
 
 function closeModal() {
+  reminderPicker?.close();
   elements.modal.hidden = true;
   state.editingId = null;
+  state.editingSnapshot = null;
+  state.formBaseline = null;
   elements.form.reset();
   elements.formError.textContent = "";
+  updateEditHint();
 }
 
 function updateCharacterCount() {
@@ -540,26 +740,109 @@ function applyTheme(theme) {
   }
 }
 
+// Faixa aceita pelo backend (Settings::validate) e o padrão dele.
+const SNOOZE_MIN = 1;
+const SNOOZE_MAX = 1_440;
+const SNOOZE_DEFAULT = 15;
+
+function validSnooze(minutes) {
+  return Number.isInteger(minutes) && minutes >= SNOOZE_MIN && minutes <= SNOOZE_MAX;
+}
+
+function snoozeOptionLabel(minutes) {
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return `${hours} hora${hours === 1 ? "" : "s"}`;
+  }
+  return `${minutes} minuto${minutes === 1 ? "" : "s"}`;
+}
+
+/// Garante que o select mostre o adiamento salvo. Um valor fora das opções
+/// (5/15/30/60) deixava o select vazio, Number("") virava 0 e toda mudança
+/// de configuração passava a falhar na validação. Valores válidos ganham uma
+/// opção própria; inválidos caem na opção mais próxima.
+function showSnoozeSetting(minutes) {
+  const select = elements.snoozeSetting;
+  select.querySelectorAll("option[data-custom]").forEach((option) => {
+    if (Number(option.value) !== minutes) option.remove();
+  });
+  const options = [...select.options];
+  let value = minutes;
+  if (!validSnooze(minutes)) {
+    const target = Number.isFinite(minutes) ? minutes : SNOOZE_DEFAULT;
+    value = options
+      .map((option) => Number(option.value))
+      .reduce((best, candidate) =>
+        Math.abs(candidate - target) < Math.abs(best - target) ? candidate : best,
+      );
+  } else if (!options.some((option) => Number(option.value) === minutes)) {
+    const option = new Option(snoozeOptionLabel(minutes), String(minutes));
+    option.dataset.custom = "true";
+    const next = options.find((item) => Number(item.value) > minutes) ?? null;
+    select.add(option, next);
+  }
+  select.value = String(value);
+}
+
+function settingsControls() {
+  return elements.settingsForm.querySelectorAll('select, input, button[type="submit"]');
+}
+
+/// Sem as configurações reais, qualquer mudança gravaria os padrões do HTML
+/// por cima delas. Até carregar, os controles ficam travados.
+function setSettingsEnabled(enabled) {
+  settingsControls().forEach((control) => {
+    control.disabled = !enabled;
+  });
+}
+
 async function loadSettings() {
   try {
-    state.settings = await invoke("get_settings");
-    document.querySelector("#themeSetting").value = state.settings.theme;
-    document.querySelector("#monitorSetting").value = state.settings.alert_monitor;
-    document.querySelector("#snoozeSetting").value = String(state.settings.snooze_minutes);
-    document.querySelector("#alwaysOnTopSetting").checked = state.settings.alert_always_on_top;
-    document.querySelector("#soundSetting").checked = state.settings.alert_sound;
-    document.querySelector("#autostartSetting").checked = state.settings.start_with_windows;
-    document.querySelector("#trayClickSetting").value = state.settings.tray_click_action;
-    applyTheme(state.settings.theme);
+    const settings = await invoke("get_settings");
+    document.querySelector("#themeSetting").value = settings.theme;
+    document.querySelector("#monitorSetting").value = settings.alert_monitor;
+    showSnoozeSetting(settings.snooze_minutes);
+    document.querySelector("#alwaysOnTopSetting").checked = settings.alert_always_on_top;
+    document.querySelector("#soundSetting").checked = settings.alert_sound;
+    document.querySelector("#autostartSetting").checked = settings.start_with_windows;
+    document.querySelector("#trayClickSetting").value = settings.tray_click_action;
+    applyTheme(settings.theme);
+    state.settings = settings;
+    state.settingsLoaded = true;
+    setSettingsEnabled(true);
+    elements.settingsRetry.hidden = true;
+    elements.settingsStatus.textContent = "";
   } catch (error) {
-    showSnackbar(errorMessage(error));
+    state.settingsLoaded = false;
+    setSettingsEnabled(false);
+    elements.settingsRetry.hidden = false;
+    elements.settingsStatus.textContent = `Não foi possível carregar as configurações: ${errorMessage(error)}`;
+  }
+}
+
+async function retryLoadSettings() {
+  elements.settingsRetry.disabled = true;
+  elements.settingsStatus.textContent = "Carregando...";
+  try {
+    await loadSettings();
+  } finally {
+    elements.settingsRetry.disabled = false;
   }
 }
 
 function currentSettings() {
+  let snoozeMinutes = Number(elements.snoozeSetting.value);
+  // Nunca envia 0/NaN: volta ao último valor salvo (ou ao padrão).
+  if (!validSnooze(snoozeMinutes)) {
+    snoozeMinutes = validSnooze(state.settings?.snooze_minutes)
+      ? state.settings.snooze_minutes
+      : SNOOZE_DEFAULT;
+  }
   return {
+    // Campos que esta tela não conhece continuam como o backend mandou.
+    ...state.settings,
     theme: document.querySelector("#themeSetting").value,
-    snooze_minutes: Number(document.querySelector("#snoozeSetting").value),
+    snooze_minutes: snoozeMinutes,
     alert_monitor: document.querySelector("#monitorSetting").value,
     alert_always_on_top: document.querySelector("#alwaysOnTopSetting").checked,
     alert_sound: document.querySelector("#soundSetting").checked,
@@ -569,6 +852,7 @@ function currentSettings() {
 }
 
 async function persistSettings(showConfirmation = false) {
+  if (!state.settingsLoaded) return;
   const settings = currentSettings();
   applyTheme(settings.theme);
   elements.settingsStatus.textContent = "Salvando...";
@@ -595,8 +879,15 @@ function autoSaveSettings() {
   persistSettings(false);
 }
 
-function selectView(view) {
-  if (state.activeView === "vault" && view !== "vault") vaultController.deactivate();
+/// Troca de aba. Resolve false quando o usuário preferiu continuar editando um
+/// formulário do cofre — aí a aba não muda.
+async function selectView(view) {
+  if (state.activeView === "vault" && view !== "vault") {
+    // O modal do cofre fica fora de #vaultView: sem fechá-lo antes, ele ficaria
+    // por cima da outra aba. Com alterações, pergunta antes de descartar.
+    if (!(await requestCloseVaultForms())) return false;
+    vaultController.deactivate();
+  }
   state.activeView = view;
   document.querySelectorAll(".nav-item").forEach((button) => {
     button.classList.toggle("active", button.dataset.view === view);
@@ -607,23 +898,42 @@ function selectView(view) {
   elements.settingsView.classList.toggle("active", view === "settings");
   if (view === "notes") notesController.activate();
   if (view === "vault") vaultController.activate();
+  return true;
 }
 
+/// A atualização nunca é instalada sozinha (isso disparava o prompt do UAC do
+/// nada e podia fechar o app): o backend só avisa e o usuário decide aqui.
 function showUpdateBanner(version) {
+  if (!version) return;
+  // Download/instalação em andamento: um novo aviso (evento ou "Verificar
+  // agora") reabilitava o botão e permitia rodar o instalador duas vezes.
+  if (state.installingUpdate) return;
   elements.updateBannerText.textContent = `Noast ${version} disponível`;
+  elements.updateBannerAction.disabled = false;
   elements.updateBanner.hidden = false;
+  elements.updateStatus.textContent = `Versão ${version} disponível. Instale pelo aviso "Atualizar e reiniciar".`;
 }
 
 async function installUpdate() {
+  if (state.installingUpdate) return;
+  state.installingUpdate = true;
   elements.updateBannerAction.disabled = true;
-  elements.updateBannerText.textContent = "Baixando atualização...";
+  elements.updateBannerText.textContent =
+    "Baixando atualização... o Windows pode pedir permissão para instalar.";
   try {
+    // O instalador encerra o processo sem avisar: grava antes o autosave
+    // pendente das notas.
+    await notesController.flush().catch(() => {});
     // Em caso de sucesso o app reinicia, então nada depois disto roda.
     await invoke("install_update");
   } catch (error) {
+    state.installingUpdate = false;
+    // Recusar o UAC não encerra mais o app: o aviso continua para tentar de novo.
+    const message = errorMessage(error);
     elements.updateBannerAction.disabled = false;
-    elements.updateBanner.hidden = true;
-    showSnackbar(errorMessage(error));
+    elements.updateBannerText.textContent = "Atualização não instalada.";
+    elements.updateStatus.textContent = message;
+    showSnackbar(message);
   }
 }
 
@@ -633,7 +943,6 @@ async function checkForUpdate() {
   try {
     const version = await invoke("check_for_update");
     if (version) {
-      elements.updateStatus.textContent = `Versão ${version} disponível.`;
       showUpdateBanner(version);
     } else {
       elements.updateStatus.textContent = "Você já está na versão mais recente.";
@@ -677,9 +986,12 @@ elements.titlebar.addEventListener("pointerdown", async (event) => {
     showSnackbar(errorMessage(error));
   }
 });
-document.querySelector("#newReminder").addEventListener("click", () => openModal());
+document.querySelector("#newReminder").addEventListener("click", () => openNewReminder());
 document.querySelector("#closeModal").addEventListener("click", closeModal);
 document.querySelector("#cancelModal").addEventListener("click", closeModal);
+// Minimizar/ocultar não descarta nada: o formulário de lembrete fica como
+// está, e o deactivate do cofre só mascara senhas e fecha formulários sem
+// alterações (os com alterações ficam abertos para quando o usuário voltar).
 document.querySelector("#minimizeWindow").addEventListener("click", () => {
   vaultController.deactivate();
   invoke("minimize_main_window");
@@ -702,16 +1014,21 @@ elements.quickWhen.addEventListener("click", (event) => {
     clearQuickChips();
     syncWeekdayPicker();
     updateWhenHint();
+    updateEditHint();
   });
 });
 
-elements.repeat.addEventListener("change", syncWeekdayPicker);
+elements.repeat.addEventListener("change", () => {
+  syncWeekdayPicker();
+  updateEditHint();
+});
 
 elements.weekdayPicker.addEventListener("click", (event) => {
   const button = event.target.closest(".weekday");
   if (button) applyWeekday(Number(button.dataset.weekday));
 });
 elements.settingsForm.addEventListener("submit", saveSettings);
+elements.settingsRetry.addEventListener("click", retryLoadSettings);
 
 elements.modal.addEventListener("click", (event) => {
   if (event.target === elements.modal) closeModal();
@@ -769,6 +1086,8 @@ elements.groups.addEventListener("keydown", (event) => {
   if (notification) openModal(notification);
 });
 
+// Esc com o calendário aberto nem chega aqui: o date-picker o consome na
+// fase de captura e fecha só o calendário.
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !elements.modal.hidden) closeModal();
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
@@ -778,19 +1097,55 @@ document.addEventListener("keydown", (event) => {
     } else if (state.activeView === "vault") {
       vaultController.createClient();
     } else {
-      selectView("reminders");
-      openModal();
+      openNewReminder();
     }
   }
 });
-
-attachDatePicker(elements.date);
 
 elements.checkUpdate.addEventListener("click", checkForUpdate);
 elements.updateBannerAction.addEventListener("click", installUpdate);
 elements.updateBannerDismiss.addEventListener("click", () => {
   elements.updateBanner.hidden = true;
 });
+
+// Rótulos que dependem do relógio (Hoje/Amanhã, Atrasados) não podem
+// envelhecer com a janela aberta ou escondida na bandeja.
+scheduleMinuteTick();
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  refreshTimeLabels();
+  // Pode ter perdido eventos enquanto estava oculta; buscar de novo é barato.
+  loadNotifications();
+});
+window.addEventListener("focus", refreshTimeLabels);
+
+// Listeners ANTES do carregamento: com autostart (--minimized) a janela é
+// criada pela bandeja, que emite "open-new-reminder" logo em seguida — se o
+// listener só fosse registrado depois dos loads, o primeiro pedido se perdia.
+// O mesmo vale para os avisos de lista alterada e de atualização.
+try {
+  await Promise.all([
+    listen("open-new-reminder", () => {
+      // O backend também guarda o pedido (caso este evento se perca durante o
+      // carregamento); consumi-lo aqui evita reabrir depois.
+      invoke("take_new_reminder_request").catch(() => {});
+      openNewReminder();
+    }),
+    listen("notifications-changed", () => loadNotifications()),
+    listen("update-available", (event) => showUpdateBanner(event.payload)),
+    // "Sair" da bandeja: grava o autosave pendente das notas antes de o
+    // backend encerrar (ele espera no máximo 2 s por esta resposta).
+    listen("app-quitting", async () => {
+      try {
+        await notesController.flush();
+      } finally {
+        invoke("ready_to_quit").catch(() => {});
+      }
+    }),
+  ]);
+} catch (error) {
+  showSnackbar(errorMessage(error));
+}
 
 await Promise.all([
   loadNotifications(),
@@ -799,9 +1154,28 @@ await Promise.all([
   notesController.load(),
   vaultController.load(),
 ]);
-await listen("update-available", (event) => showUpdateBanner(event.payload));
-await listen("notifications-changed", loadNotifications);
-await listen("open-new-reminder", () => {
-  selectView("reminders");
-  openModal();
-});
+
+// Pedidos feitos antes de a janela estar pronta para ouvir os eventos acima
+// ficam guardados no backend; consumi-los fecha a janela de corrida. Abrir
+// duas vezes (evento + pedido guardado) é inofensivo: openNewReminder só foca
+// um formulário já aberto.
+try {
+  if (await invoke("take_new_reminder_request")) openNewReminder();
+} catch {
+  // Backend sem o comando (ou sem pedido): nada a fazer.
+}
+// Arquivo danificado ou bloqueado na abertura: o backend segue sem esses
+// dados (ou sem gravar), e o usuário precisa saber disso agora, não quando
+// tentar salvar.
+try {
+  const warnings = await invoke("get_load_warnings");
+  if (warnings.length > 0) showSnackbar(warnings.join(" "), "Entendi", () => {});
+} catch {
+  // Backend sem o comando: nada a avisar.
+}
+try {
+  const version = await invoke("get_available_update");
+  if (version) showUpdateBanner(version);
+} catch {
+  // Sem versão detectada ainda; o evento "update-available" cobre o resto.
+}

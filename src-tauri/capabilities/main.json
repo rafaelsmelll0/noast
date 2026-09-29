@@ -1,10 +1,39 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
-  "description": "Permissões da janela principal do Noast",
-  "windows": ["main"],
+  "description": "Permissões da janela principal do Noast: lembretes, notas, cofre e configurações",
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "allow-app-version",
+    "allow-check-for-update",
+    "allow-delete-notification",
+    "allow-get-available-update",
+    "allow-get-notifications",
+    "allow-get-settings",
+    "allow-hide-main-window",
+    "allow-install-update",
+    "allow-minimize-main-window",
+    "allow-ready-to-quit",
+    "allow-restore-notification",
+    "allow-save-notification",
+    "allow-save-user-settings",
+    "allow-take-new-reminder-request",
+    "allow-delete-note",
+    "allow-get-notes",
+    "allow-restore-note",
+    "allow-save-note",
+    "allow-copy-secret",
+    "allow-delete-vault-access",
+    "allow-delete-vault-client",
+    "allow-get-vault-access",
+    "allow-get-vault-catalog",
+    "allow-open-external-url",
+    "allow-save-vault-access",
+    "allow-save-vault-client",
+    "allow-get-load-warnings"
   ]
 }

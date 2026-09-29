@@ -63,8 +63,29 @@ export function monthGrid(year, month) {
   return days;
 }
 
+/// Onde o calendário deve aparecer, em coordenadas da janela. Abre embaixo do
+/// campo; se não couber e houver mais espaço em cima, abre para cima. Em
+/// qualquer caso fica dentro da janela (com `margin` de folga), para nunca
+/// ser cortado — antes ele morava dentro do modal com rolagem e a última
+/// semana e o botão "Hoje" ficavam escondidos.
+export function popoverPlacement(anchor, size, viewport, { gap = 6, margin = 8 } = {}) {
+  const spaceBelow = viewport.height - anchor.bottom - gap - margin;
+  const spaceAbove = anchor.top - gap - margin;
+  const above = size.height > spaceBelow && spaceAbove > spaceBelow;
+  const wantedTop = above ? anchor.top - gap - size.height : anchor.bottom + gap;
+  const clamp = (value, max) => Math.max(margin, Math.min(value, max));
+  return {
+    top: clamp(wantedTop, viewport.height - size.height - margin),
+    left: clamp(anchor.left, viewport.width - size.width - margin),
+    above,
+  };
+}
+
+/// Anexa o calendário ao campo e devolve um controle mínimo para quem o usa
+/// (fechar ao resetar o formulário, saber se está aberto antes de tratar
+/// Enter/Esc).
 export function attachDatePicker(input) {
-  if (!input || input.dataset.pickerReady === "true") return;
+  if (!input || input.dataset.pickerReady === "true") return null;
   input.dataset.pickerReady = "true";
 
   const field = document.createElement("button");
@@ -140,6 +161,28 @@ export function attachDatePicker(input) {
       </div>`;
   }
 
+  /// O popup é `position: fixed` para escapar do `overflow` do modal. Um
+  /// ancestral com `backdrop-filter`/`transform` (o fundo do modal) vira o
+  /// bloco de referência do fixed; medir o popup em (0, 0) revela esse
+  /// deslocamento, e a conta funciona com ou sem ele.
+  function place() {
+    if (popover.hidden) return;
+    popover.style.left = "0px";
+    popover.style.top = "0px";
+    const origin = popover.getBoundingClientRect();
+    const { top, left, above } = popoverPlacement(
+      field.getBoundingClientRect(),
+      { width: origin.width, height: origin.height },
+      {
+        width: document.documentElement.clientWidth,
+        height: document.documentElement.clientHeight,
+      },
+    );
+    popover.style.left = `${left - origin.left}px`;
+    popover.style.top = `${top - origin.top}px`;
+    popover.classList.toggle("is-above", above);
+  }
+
   function open() {
     const selected = parseIso(input.value) ?? new Date();
     viewYear = selected.getFullYear();
@@ -147,6 +190,7 @@ export function attachDatePicker(input) {
     render();
     popover.hidden = false;
     field.setAttribute("aria-expanded", "true");
+    place();
   }
 
   function close() {
@@ -177,6 +221,8 @@ export function attachDatePicker(input) {
         viewYear += 1;
       }
       render();
+      // Meses com uma semana a mais ou a menos mudam a altura do popup.
+      place();
       return;
     }
     if (event.target.closest(".date-today")) {
@@ -193,13 +239,26 @@ export function attachDatePicker(input) {
     if (!popover.contains(event.target) && !field.contains(event.target)) close();
   });
 
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !popover.hidden) {
-      event.stopPropagation();
+  // Esc com o calendário aberto fecha só o calendário. Escutar na fase de
+  // captura em `window` garante rodar antes dos listeners de `document` do
+  // app (que fechariam o formulário inteiro ou a janela Personalizar), e o
+  // stopImmediatePropagation impede que eles vejam a tecla — stopPropagation
+  // no próprio document não bastava, porque o listener do app rodava antes.
+  window.addEventListener(
+    "keydown",
+    (event) => {
+      if (event.key !== "Escape" || popover.hidden) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
       close();
       field.focus();
-    }
-  });
+    },
+    true,
+  );
+
+  // Rolar o modal ou redimensionar a janela move o campo: o popup acompanha.
+  window.addEventListener("scroll", place, true);
+  window.addEventListener("resize", place);
 
   input.addEventListener("change", syncFieldLabel);
   input.addEventListener("input", syncFieldLabel);
@@ -222,7 +281,18 @@ export function attachDatePicker(input) {
 
   // form.reset() limpa o campo por dentro, sem passar pelo setter acima.
   // O atraso deixa o navegador aplicar o reset antes de reler o valor.
-  input.form?.addEventListener("reset", () => window.setTimeout(syncFieldLabel, 0));
+  // Fechar o calendário aqui evita que ele reapareça aberto na próxima vez
+  // que o formulário for mostrado (ex.: salvo com Enter com o popup aberto).
+  input.form?.addEventListener("reset", () => {
+    close();
+    window.setTimeout(syncFieldLabel, 0);
+  });
 
   syncFieldLabel();
+
+  return {
+    field,
+    close,
+    isOpen: () => !popover.hidden,
+  };
 }

@@ -1,6 +1,6 @@
 [package]
 name = "noast"
-version = "0.8.0"
+version = "0.8.1"
 description = "Noast - lembretes pessoais"
 authors = ["Rafael"]
 edition = "2021"
@@ -28,7 +28,11 @@ chrono         = { version = "0.4", features = ["serde"] }
 windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_Security_Cryptography",
+  "Win32_System_Com",
+  "Win32_System_DataExchange",
   "Win32_System_Diagnostics_Debug",
+  "Win32_System_Memory",
+  "Win32_System_Registry",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }

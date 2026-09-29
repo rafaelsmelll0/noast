@@ -1,23 +1,17 @@
 use crate::model::Vault;
-use crate::repository::{load_protected_backup, load_protected_bytes, save_protected_bytes};
+use crate::repository::{load_protected, save_protected_bytes};
 use std::path::Path;
 
-pub fn load(path: &Path) -> Result<Vault, String> {
-    let Some(encrypted) = load_protected_bytes(path)? else {
-        return Ok(Vault::default());
-    };
-    match decode(&encrypted) {
-        Ok(vault) => Ok(vault),
-        Err(primary_error) => {
-            if let Some(backup) = load_protected_backup(path)? {
-                if let Ok(vault) = decode(&backup) {
-                    return Ok(vault);
-                }
-            }
-            Err(format!(
-                "{primary_error} O backup criptografado também não pôde ser recuperado."
-            ))
-        }
+/// Abre o cofre. Um erro aqui não pode derrubar o app (os lembretes não
+/// dependem do cofre): quem chama deixa só o cofre indisponível, sem gravar
+/// por cima do arquivo.
+/// Devolve também, quando houver, o motivo para não gravar nesta sessão
+/// (conteúdo veio do backup porque o principal estava ilegível).
+pub fn load(path: &Path, log: &Path) -> Result<(Vault, Option<String>), String> {
+    match load_protected(path, log, decode) {
+        Ok(Some(loaded)) => Ok((loaded.value, loaded.read_only)),
+        Ok(None) => Ok((Vault::default(), None)),
+        Err(error) => Err(error.message().to_string()),
     }
 }
 
@@ -154,7 +148,8 @@ mod tests {
             .windows(b"segredo-improvavel-123".len())
             .any(|window| window == b"segredo-improvavel-123"));
 
-        let reopened = load(&path).expect("load");
+        let (reopened, read_only) = load(&path, &path.with_extension("log")).expect("load");
+        assert!(read_only.is_none());
         assert_eq!(reopened.accesses[0].password, "segredo-improvavel-123");
 
         let _ = fs::remove_file(&path);

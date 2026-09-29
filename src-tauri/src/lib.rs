@@ -1,3 +1,4 @@
+mod clipboard;
 mod model;
 mod repository;
 mod scheduler;
@@ -11,17 +12,21 @@ use model::{
 use repository::{
     append_log, load_notes, load_notifications, load_settings, log_path, notes_path,
     notifications_path, save_notes, save_notifications, save_settings, settings_path, vault_path,
+    LoadError,
 };
 use scheduler::{
     advance_after, is_due, occurrence_key, reschedule_to, snooze, snooze_until_tomorrow,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
+#[cfg(not(debug_assertions))]
 use tauri_plugin_autostart::ManagerExt;
 
 #[derive(Clone)]
@@ -46,6 +51,7 @@ struct SnoozeMenuState(Arc<Mutex<SnoozeMenuSession>>);
 struct SnoozeMenuSession {
     target_id: Option<String>,
     visible: bool,
+    opened_at: Option<Instant>,
 }
 
 #[derive(serde::Deserialize)]
@@ -62,6 +68,72 @@ struct CustomSnoozeState(Arc<Mutex<CustomSnoozeSession>>);
 struct CustomSnoozeSession {
     target_id: Option<String>,
     visible: bool,
+    opened_at: Option<Instant>,
+}
+
+/// Um submenu esquecido aberto não pode desligar para sempre o watchdog do
+/// toast: passado este tempo, o toast volta a ser resgatado mesmo assim.
+const SUBMENU_GRACE: Duration = Duration::from_secs(120);
+
+/// A bandeja pediu "Novo lembrete" enquanto a janela principal ainda estava
+/// sendo criada: o evento emitido nessa hora se perde (o webview não carregou),
+/// então o frontend consulta este pedido ao terminar de abrir.
+#[derive(Default)]
+struct NewReminderRequest(AtomicBool);
+
+/// Versão nova detectada pelo check automático, para a janela principal
+/// mostrar o aviso mesmo que o evento tenha sido emitido com ela fechada.
+#[derive(Default)]
+struct AvailableUpdate(Mutex<Option<String>>);
+
+/// Número de sequência da última cópia de segredo ainda não limpa, para
+/// limpar também ao encerrar o app antes dos 30 s.
+#[derive(Default)]
+struct PendingSecret(Mutex<Option<u32>>);
+
+/// Limpa a área de transferência se ela ainda contém o último segredo copiado.
+/// Chamado ao encerrar e no fim do prazo de `copy_secret`.
+fn clear_pending_secret(app: &AppHandle) {
+    let Some(sequence) = app
+        .try_state::<PendingSecret>()
+        .and_then(|state| state.0.lock().ok().and_then(|mut value| value.take()))
+    else {
+        return;
+    };
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    match clipboard::clear_if_unchanged(&window, sequence) {
+        Ok(true) => log(app, "Área de transferência limpa (segredo do cofre)."),
+        Ok(false) => {}
+        Err(error) => log(
+            app,
+            &format!("Falha ao limpar a área de transferência: {error}"),
+        ),
+    }
+}
+
+/// Motivo pelo qual um arquivo não pode ser gravado nesta sessão. Preenchido
+/// quando a leitura na abertura falhou de um jeito em que gravar por cima
+/// destruiria dados que provavelmente estão bons (disco ilegível, DPAPI).
+#[derive(Default)]
+struct StoreHealth {
+    notifications: Mutex<Option<String>>,
+    notes: Mutex<Option<String>>,
+    settings: Mutex<Option<String>>,
+    vault: Mutex<Option<String>>,
+    /// Avisos da abertura para a janela principal mostrar.
+    notices: Mutex<Vec<String>>,
+}
+
+fn ensure_writable(slot: &Mutex<Option<String>>, what: &str) -> Result<(), String> {
+    match lock(slot, what)?.as_ref() {
+        Some(reason) => Err(format!(
+            "{what} não puderam ser lidos ao abrir o Noast, então nada será gravado por cima \
+             deles. Reinicie o Noast. Detalhe: {reason}"
+        )),
+        None => Ok(()),
+    }
 }
 
 #[derive(Clone)]
@@ -71,6 +143,7 @@ struct Paths {
     vault: PathBuf,
     settings: PathBuf,
     log: PathBuf,
+    health: Arc<StoreHealth>,
 }
 
 fn lock<'a, T>(mutex: &'a Mutex<T>, name: &str) -> Result<MutexGuard<'a, T>, String> {
@@ -89,68 +162,237 @@ fn log(app: &AppHandle, message: &str) {
 
 fn emit_main_changed(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.emit("notifications-changed", ());
+        if let Err(error) = window.emit("notifications-changed", ()) {
+            log(app, &format!("Falha ao avisar a janela principal: {error}"));
+        }
     }
 }
 
+/// Executa `task` no thread principal (APIs de janela falham ou travam fora
+/// dele) e registra no log se nem o agendamento funcionar.
+fn on_main_thread(
+    app: &AppHandle,
+    what: &'static str,
+    task: impl FnOnce(&AppHandle) + Send + 'static,
+) {
+    let handle = app.clone();
+    if let Err(error) = app.run_on_main_thread(move || task(&handle)) {
+        log(app, &format!("Falha ao agendar {what}: {error}"));
+    }
+}
+
+/// Avisa o toast de que a fila mudou. Qualquer mudança desloca as linhas do
+/// toast (e o redimensiona), então o submenu de adiar — posicionado ao lado
+/// de uma linha — é fechado; o Personalizar só fecha se o lembrete dele saiu
+/// da fila. Com a fila vazia, fecha tudo.
 fn emit_queue_changed(app: &AppHandle) {
-    let queue_empty = app
-        .try_state::<PendingState>()
-        .and_then(|state| {
-            lock(&state.0, "alertas pendentes")
-                .ok()
-                .map(|queue| queue.is_empty())
-        })
-        .unwrap_or(false);
-    if queue_empty {
-        hide_alert_windows(app);
+    let queue: Option<Vec<String>> = app.try_state::<PendingState>().and_then(|state| {
+        lock(&state.0, "alertas pendentes")
+            .ok()
+            .map(|queue| queue.iter().map(|item| item.id.clone()).collect())
+    });
+    match queue {
+        Some(ids) if ids.is_empty() => hide_alert_windows(app),
+        Some(ids) => {
+            hide_snooze_menu_window(app);
+            let custom_target_gone = app
+                .try_state::<CustomSnoozeState>()
+                .and_then(|state| {
+                    lock(&state.0, "personalizar adiamento")
+                        .ok()
+                        .map(|session| {
+                            session.visible
+                                && session
+                                    .target_id
+                                    .as_ref()
+                                    .is_some_and(|target| !ids.contains(target))
+                        })
+                })
+                .unwrap_or(false);
+            if custom_target_gone {
+                hide_custom_snooze_window(app);
+            }
+        }
+        None => {}
     }
     if let Some(window) = app.get_webview_window("toast") {
-        let _ = window.emit("queue-updated", ());
+        if let Err(error) = window.emit("queue-updated", ()) {
+            log(app, &format!("Falha ao avisar o toast: {error}"));
+        }
     }
+}
+
+/// Esconde e estaciona fora da tela uma janela de alerta. A ocultação roda
+/// depois, no thread principal; até lá a janela pode ter sido reaberta (menu
+/// reaberto, novo alerta no toast). Por isso a decisão é refeita na hora de
+/// executar: esconder uma janela que voltou a ser necessária a deixava oculta
+/// com o estado dizendo "visível" — e, no toast, violava o invariante de
+/// nunca esconder com alertas na fila.
+fn park_window(app: &AppHandle, label: &'static str) {
+    on_main_thread(app, "ocultação de janela", move |handle| {
+        let still_wanted = match label {
+            "toast" => handle
+                .try_state::<PendingState>()
+                .and_then(|state| {
+                    lock(&state.0, "alertas pendentes")
+                        .ok()
+                        .map(|q| !q.is_empty())
+                })
+                .unwrap_or(false),
+            "snooze-menu" => handle
+                .try_state::<SnoozeMenuState>()
+                .and_then(|state| lock(&state.0, "menu de adiamento").ok().map(|s| s.visible))
+                .unwrap_or(false),
+            "custom-snooze" => handle
+                .try_state::<CustomSnoozeState>()
+                .and_then(|state| {
+                    lock(&state.0, "personalizar adiamento")
+                        .ok()
+                        .map(|s| s.visible)
+                })
+                .unwrap_or(false),
+            _ => false,
+        };
+        if still_wanted {
+            return;
+        }
+        let Some(window) = handle.get_webview_window(label) else {
+            return;
+        };
+        if let Err(error) = window.hide() {
+            log(handle, &format!("Falha ao ocultar {label}: {error}"));
+        }
+        if let Err(error) = window.set_position(PhysicalPosition::new(-10_000, -10_000)) {
+            log(handle, &format!("Falha ao estacionar {label}: {error}"));
+        }
+    });
+}
+
+fn hide_snooze_menu_window(app: &AppHandle) {
+    if let Some(state) = app.try_state::<SnoozeMenuState>() {
+        if let Ok(mut session) = lock(&state.0, "menu de adiamento") {
+            session.visible = false;
+            session.opened_at = None;
+        }
+    }
+    park_window(app, "snooze-menu");
+}
+
+fn hide_custom_snooze_window(app: &AppHandle) {
+    if let Some(state) = app.try_state::<CustomSnoozeState>() {
+        if let Ok(mut session) = lock(&state.0, "personalizar adiamento") {
+            session.visible = false;
+            session.opened_at = None;
+        }
+    }
+    park_window(app, "custom-snooze");
 }
 
 /// Fecha apenas os submenus de adiamento (menu "…" e Personalizar), sem tocar
 /// no toast. Usado quando o toast deve permanecer (ex.: abrir o Noast).
 fn hide_snooze_submenus(app: &AppHandle) {
-    if let Some(state) = app.try_state::<SnoozeMenuState>() {
-        if let Ok(mut session) = lock(&state.0, "menu de adiamento") {
-            session.visible = false;
-        }
-    }
-    if let Some(menu) = app.get_webview_window("snooze-menu") {
-        let _ = menu.hide();
-        let _ = menu.set_position(PhysicalPosition::new(-10_000, -10_000));
-    }
-    if let Some(state) = app.try_state::<CustomSnoozeState>() {
-        if let Ok(mut session) = lock(&state.0, "personalizar adiamento") {
-            session.visible = false;
-        }
-    }
-    if let Some(window) = app.get_webview_window("custom-snooze") {
-        let _ = window.hide();
-        let _ = window.set_position(PhysicalPosition::new(-10_000, -10_000));
-    }
+    hide_snooze_menu_window(app);
+    hide_custom_snooze_window(app);
 }
 
 fn hide_alert_windows(app: &AppHandle) {
     hide_snooze_submenus(app);
-    if let Some(toast) = app.get_webview_window("toast") {
-        let _ = toast.hide();
-        let _ = toast.set_position(PhysicalPosition::new(-10_000, -10_000));
-    }
+    park_window(app, "toast");
 }
 
 fn persist_notifications(paths: &Paths, notifications: &[Notification]) -> Result<(), String> {
+    ensure_writable(&paths.health.notifications, "Os lembretes")?;
     save_notifications(&paths.notifications, notifications)
 }
 
 fn persist_notes(paths: &Paths, notes: &[Note]) -> Result<(), String> {
+    ensure_writable(&paths.health.notes, "As notas")?;
     save_notes(&paths.notes, notes)
 }
 
 fn persist_vault(paths: &Paths, vault: &Vault) -> Result<(), String> {
+    ensure_vault_available(paths)?;
     vault::save(&paths.vault, vault)
+}
+
+fn ensure_vault_available(paths: &Paths) -> Result<(), String> {
+    match lock(&paths.health.vault, "cofre")?.as_ref() {
+        Some(reason) => Err(format!(
+            "Cofre indisponível: o arquivo não pôde ser aberto neste usuário do Windows e foi \
+             preservado sem alterações. Detalhe: {reason}"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Aplica `change` numa cópia da lista e só a adota depois de gravada: uma
+/// falha de disco não deixa a memória diferente do arquivo.
+fn update_notifications<R>(
+    paths: &Paths,
+    state: &NotificationState,
+    change: impl FnOnce(&mut Vec<Notification>) -> Result<R, String>,
+) -> Result<R, String> {
+    let mut current = lock(&state.0, "lembretes")?;
+    let mut next = current.clone();
+    let result = change(&mut next)?;
+    persist_notifications(paths, &next)?;
+    *current = next;
+    Ok(result)
+}
+
+fn update_notes<R>(
+    paths: &Paths,
+    state: &NoteState,
+    change: impl FnOnce(&mut Vec<Note>) -> Result<R, String>,
+) -> Result<R, String> {
+    let mut current = lock(&state.0, "notas")?;
+    let mut next = current.clone();
+    let result = change(&mut next)?;
+    persist_notes(paths, &next)?;
+    *current = next;
+    Ok(result)
+}
+
+/// Mesmo horário para o formulário, que só edita até o minuto: lembretes
+/// adiados por versões antigas guardavam segundos.
+fn same_minute(left: &str, right: &str) -> bool {
+    left.get(..16)
+        .is_some_and(|prefix| Some(prefix) == right.get(..16))
+}
+
+const NOT_PENDING: &str = "Este lembrete não está mais pendente.";
+
+/// Age sobre um lembrete que está na fila do toast. As ações do toast e dos
+/// submenus se referem ao alerta que o usuário VIU: se ele já saiu da fila
+/// (concluído, editado ou excluído em outro lugar), agir mesmo assim
+/// ressuscitaria um lembrete concluído. Trava lembretes → fila, nesta ordem,
+/// durante toda a operação — a mesma ordem de `enqueue_alert`.
+fn act_on_pending(
+    paths: &Paths,
+    state: &NotificationState,
+    pending: &PendingState,
+    ids: &[String],
+    mut action: impl FnMut(&mut Notification) -> Result<(), String>,
+) -> Result<usize, String> {
+    let mut notifications = lock(&state.0, "lembretes")?;
+    let mut queue = lock(&pending.0, "alertas pendentes")?;
+    let targets: Vec<&String> = ids
+        .iter()
+        .filter(|id| queue.iter().any(|item| &item.id == *id))
+        .collect();
+    if targets.is_empty() {
+        return Ok(0);
+    }
+    let mut next = notifications.clone();
+    for id in &targets {
+        if let Some(notification) = next.iter_mut().find(|item| &item.id == *id) {
+            action(notification)?;
+        }
+    }
+    persist_notifications(paths, &next)?;
+    *notifications = next;
+    queue.retain(|item| !targets.contains(&&item.id));
+    Ok(targets.len())
 }
 
 #[tauri::command]
@@ -175,34 +417,66 @@ fn save_notification(
     notification.text = notification.text.trim().to_string();
     notification.validate()?;
 
+    // Mesmo horário e mesma repetição = só o texto mudou. Aí o lembrete
+    // mantém tudo que o agendador sabe dele (disparo, série, dia da série) e,
+    // se estiver tocando agora, continua no toast com o texto novo — tirá-lo
+    // da fila sem limpar o disparo o fazia sumir para sempre.
+    //
+    // Trava lembretes → fila (a ordem de `enqueue_alert`) durante tudo: com a
+    // fila tratada à parte, o agendador podia enfileirar o lembrete recém-
+    // salvo no intervalo e o `retain` seguinte o apagava.
     {
         let mut notifications = lock(&state.0, "lembretes")?;
-        if let Some(current) = notifications
-            .iter()
-            .position(|item| item.id == notification.id)
-        {
-            let existing = &notifications[current];
-            notification.done = existing.done;
-            if existing.datetime == notification.datetime && existing.repeat == notification.repeat
-            {
-                notification.last_fired = existing.last_fired.clone();
-                // Editar só o texto de um lembrete adiado não pode mover a
-                // série; alterar data ou repetição, sim — aí a âncora antiga
-                // não vale mais e é descartada.
-                notification.series_datetime = existing.series_datetime.clone();
-            } else {
-                notification.last_fired.clear();
+        let mut queue = lock(&pending.0, "alertas pendentes")?;
+        let mut next = notifications.clone();
+        let slot_kept = match next.iter_mut().find(|item| item.id == notification.id) {
+            None => {
                 notification.done = false;
+                notification.last_fired.clear();
+                notification.series_datetime.clear();
+                notification.series_day = 0;
+                next.push(notification);
+                false
             }
-            notifications[current] = notification;
+            Some(existing) => {
+                let kept = same_minute(&existing.datetime, &notification.datetime)
+                    && existing.repeat == notification.repeat;
+                if kept {
+                    existing.text = notification.text;
+                } else {
+                    // Data ou repetição novas: a âncora antiga da série não
+                    // vale mais. Só a hora mudou (mesmo dia, mesma repetição):
+                    // o dia pretendido da série mensal continua valendo — um
+                    // "todo dia 31" parado em 28/02 não pode virar "dia 28".
+                    let same_day = existing.datetime.get(..10).is_some()
+                        && existing.datetime.get(..10) == notification.datetime.get(..10)
+                        && existing.repeat == notification.repeat;
+                    notification.series_day = if same_day { existing.series_day } else { 0 };
+                    notification.done = false;
+                    notification.last_fired.clear();
+                    notification.series_datetime.clear();
+                    *existing = notification;
+                }
+                kept
+            }
+        };
+        persist_notifications(&paths, &next)?;
+        if slot_kept {
+            let text = next
+                .iter()
+                .find(|item| item.id == notification_id)
+                .map(|item| item.text.clone());
+            if let (Some(text), Some(queued)) = (
+                text,
+                queue.iter_mut().find(|item| item.id == notification_id),
+            ) {
+                queued.text = text;
+            }
         } else {
-            notification.done = false;
-            notification.last_fired.clear();
-            notifications.push(notification);
+            queue.retain(|item| item.id != notification_id);
         }
-        persist_notifications(&paths, &notifications)?;
+        *notifications = next;
     }
-    lock(&pending.0, "alertas pendentes")?.retain(|item| item.id != notification_id);
 
     emit_main_changed(&app);
     emit_queue_changed(&app);
@@ -215,17 +489,21 @@ fn restore_notification(
     app: AppHandle,
     paths: tauri::State<Paths>,
     state: tauri::State<NotificationState>,
-    notification: Notification,
+    mut notification: Notification,
 ) -> Result<(), String> {
     notification.validate()?;
-    {
-        let mut notifications = lock(&state.0, "lembretes")?;
+    // Excluído enquanto tocava: sem limpar o disparo, o lembrete restaurado
+    // ficaria vencido e mudo. Limpo, ele volta a alertar se ainda for devido.
+    if !notification.done {
+        notification.last_fired.clear();
+    }
+    update_notifications(&paths, &state, |notifications| {
         if notifications.iter().any(|item| item.id == notification.id) {
             return Err("Este lembrete já foi restaurado.".to_string());
         }
         notifications.push(notification);
-        persist_notifications(&paths, &notifications)?;
-    }
+        Ok(())
+    })?;
     emit_main_changed(&app);
     log(&app, "Lembrete restaurado.");
     Ok(())
@@ -239,15 +517,14 @@ fn delete_notification(
     pending: tauri::State<PendingState>,
     id: String,
 ) -> Result<(), String> {
-    {
-        let mut notifications = lock(&state.0, "lembretes")?;
+    update_notifications(&paths, &state, |notifications| {
         let previous_len = notifications.len();
         notifications.retain(|item| item.id != id);
         if notifications.len() == previous_len {
             return Err("Lembrete não encontrado.".to_string());
         }
-        persist_notifications(&paths, &notifications)?;
-    }
+        Ok(())
+    })?;
     lock(&pending.0, "alertas pendentes")?.retain(|item| item.id != id);
 
     emit_main_changed(&app);
@@ -272,8 +549,7 @@ fn save_note(
     note.validate()?;
     let now = Local::now().to_rfc3339();
 
-    {
-        let mut notes = lock(&state.0, "notas")?;
+    let note = update_notes(&paths, &state, |notes| {
         if let Some(current) = notes.iter().position(|item| item.id == note.id) {
             note.created_at = notes[current].created_at.clone();
             note.updated_at = now;
@@ -283,8 +559,8 @@ fn save_note(
             note.updated_at = now;
             notes.push(note.clone());
         }
-        persist_notes(&paths, &notes)?;
-    }
+        Ok(note)
+    })?;
 
     log(&app, "Nota salva.");
     Ok(note)
@@ -300,8 +576,7 @@ fn restore_note(
     note.title = note.title.trim().to_string();
     note.validate()?;
 
-    {
-        let mut notes = lock(&state.0, "notas")?;
+    let note = update_notes(&paths, &state, |notes| {
         if notes.iter().any(|item| item.id == note.id) {
             return Err("Esta nota já foi restaurada.".to_string());
         }
@@ -310,8 +585,8 @@ fn restore_note(
         }
         note.updated_at = Local::now().to_rfc3339();
         notes.push(note.clone());
-        persist_notes(&paths, &notes)?;
-    }
+        Ok(note)
+    })?;
 
     log(&app, "Nota restaurada.");
     Ok(note)
@@ -324,22 +599,25 @@ fn delete_note(
     state: tauri::State<NoteState>,
     id: String,
 ) -> Result<(), String> {
-    {
-        let mut notes = lock(&state.0, "notas")?;
+    update_notes(&paths, &state, |notes| {
         let previous_len = notes.len();
         notes.retain(|item| item.id != id);
         if notes.len() == previous_len {
             return Err("Nota não encontrada.".to_string());
         }
-        persist_notes(&paths, &notes)?;
-    }
+        Ok(())
+    })?;
 
     log(&app, "Nota excluída.");
     Ok(())
 }
 
 #[tauri::command]
-fn get_vault_catalog(state: tauri::State<VaultState>) -> Result<VaultCatalog, String> {
+fn get_vault_catalog(
+    paths: tauri::State<Paths>,
+    state: tauri::State<VaultState>,
+) -> Result<VaultCatalog, String> {
+    ensure_vault_available(&paths)?;
     let vault = lock(&state.0, "cofre")?;
     Ok(VaultCatalog::from(&*vault))
 }
@@ -353,6 +631,7 @@ fn save_vault_client(
     client.name = client.name.trim().to_string();
     client.notes = client.notes.trim().to_string();
     client.validate()?;
+    ensure_vault_available(&paths)?;
     let now = Local::now().to_rfc3339();
 
     {
@@ -400,6 +679,7 @@ fn delete_vault_client(
     state: tauri::State<VaultState>,
     id: String,
 ) -> Result<(), String> {
+    ensure_vault_available(&paths)?;
     let mut vault = lock(&state.0, "cofre")?;
     let mut next = vault.clone();
     let previous_len = next.clients.len();
@@ -419,7 +699,12 @@ fn delete_vault_client(
 }
 
 #[tauri::command]
-fn get_vault_access(state: tauri::State<VaultState>, id: String) -> Result<VaultAccess, String> {
+fn get_vault_access(
+    paths: tauri::State<Paths>,
+    state: tauri::State<VaultState>,
+    id: String,
+) -> Result<VaultAccess, String> {
+    ensure_vault_available(&paths)?;
     lock(&state.0, "cofre")?
         .accesses
         .iter()
@@ -441,6 +726,7 @@ fn save_vault_access(
     access.recovery_email = access.recovery_email.trim().to_string();
     access.notes = access.notes.trim().to_string();
     access.validate()?;
+    ensure_vault_available(&paths)?;
     let now = Local::now().to_rfc3339();
 
     {
@@ -470,6 +756,7 @@ fn delete_vault_access(
     state: tauri::State<VaultState>,
     id: String,
 ) -> Result<(), String> {
+    ensure_vault_available(&paths)?;
     let mut vault = lock(&state.0, "cofre")?;
     let mut next = vault.clone();
     let previous_len = next.accesses.len();
@@ -482,10 +769,67 @@ fn delete_vault_access(
     Ok(())
 }
 
+/// Copia um segredo do cofre: fora do histórico do Win+V e da nuvem, e limpo
+/// sozinho depois de um tempo se ninguém copiou outra coisa por cima.
+#[tauri::command]
+fn copy_secret(
+    app: AppHandle,
+    secret: tauri::State<PendingSecret>,
+    value: String,
+) -> Result<(), String> {
+    const CLEAR_AFTER: Duration = Duration::from_secs(30);
+    if value.is_empty() {
+        return Err("Nada para copiar.".to_string());
+    }
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Janela principal indisponível.".to_string())?;
+    let sequence = clipboard::copy_sensitive(&window, &value)?;
+    *lock(&secret.0, "área de transferência")? = Some(sequence);
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(CLEAR_AFTER);
+        on_main_thread(
+            &handle,
+            "limpeza da área de transferência",
+            move |handle| {
+                // Só limpa se esta ainda é a última cópia de segredo: uma cópia
+                // mais nova tem o próprio prazo.
+                let current = handle
+                    .try_state::<PendingSecret>()
+                    .and_then(|state| state.0.lock().ok().and_then(|value| *value));
+                if current == Some(sequence) {
+                    clear_pending_secret(handle);
+                }
+            },
+        );
+    });
+    Ok(())
+}
+
 #[tauri::command]
 fn open_external_url(url: String) -> Result<(), String> {
-    let normalized = if url.starts_with("https://") || url.starts_with("http://") {
+    let url = url.trim().to_string();
+    let lower = url.to_ascii_lowercase();
+    let has_scheme = lower.split_once(':').is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "+.-".contains(character))
+    }) && !lower.split_once(':').is_some_and(|(_, rest)| {
+        // "host:porta" não é esquema.
+        rest.chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+    });
+    let normalized = if ["http://", "https://", "ftp://", "sftp://"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+    {
         url
+    } else if has_scheme {
+        // file:, javascript:, ms-*: e afins abririam programas ou arquivos locais.
+        return Err("Só é possível abrir endereços http, https, ftp ou sftp.".to_string());
     } else {
         format!("https://{url}")
     };
@@ -530,19 +874,15 @@ fn open_external_url(url: String) -> Result<(), String> {
     }
 }
 
-fn finish_notification(
-    id: &str,
-    now: NaiveDateTime,
-    paths: &Paths,
-    state: &NotificationState,
-) -> Result<(), String> {
-    let mut notifications = lock(&state.0, "lembretes")?;
-    let notification = notifications
-        .iter_mut()
-        .find(|item| item.id == id)
-        .ok_or_else(|| "Lembrete não encontrado.".to_string())?;
-    advance_after(notification, now)?;
-    persist_notifications(paths, &notifications)
+/// Resposta comum às ações do toast: avisa as janelas e, se o alvo já não
+/// estava na fila, informa quem chamou.
+fn after_toast_action(app: &AppHandle, acted: usize) -> Result<(), String> {
+    emit_main_changed(app);
+    emit_queue_changed(app);
+    if acted == 0 {
+        return Err(NOT_PENDING.to_string());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -553,10 +893,16 @@ fn mark_done(
     pending: tauri::State<PendingState>,
     id: String,
 ) -> Result<(), String> {
-    finish_notification(&id, Local::now().naive_local(), &paths, &state)?;
-    lock(&pending.0, "alertas pendentes")?.retain(|item| item.id != id);
+    let now = Local::now().naive_local();
+    let acted = act_on_pending(&paths, &state, &pending, &[id], |notification| {
+        advance_after(notification, now)
+    })?;
+    // Concluir algo que já saiu da fila é inofensivo: só ressincroniza o toast.
     emit_main_changed(&app);
     emit_queue_changed(&app);
+    if acted == 0 {
+        log(&app, "Concluir ignorado: o lembrete já não estava na fila.");
+    }
     Ok(())
 }
 
@@ -572,20 +918,12 @@ fn snooze_notification(
     if !(1..=1_440).contains(&minutes) {
         return Err("O adiamento deve ficar entre 1 minuto e 24 horas.".to_string());
     }
-
-    {
-        let mut notifications = lock(&state.0, "lembretes")?;
-        let notification = notifications
-            .iter_mut()
-            .find(|item| item.id == id)
-            .ok_or_else(|| "Lembrete não encontrado.".to_string())?;
-        snooze(notification, minutes, Local::now().naive_local());
-        persist_notifications(&paths, &notifications)?;
-    }
-    lock(&pending.0, "alertas pendentes")?.retain(|item| item.id != id);
-    emit_main_changed(&app);
-    emit_queue_changed(&app);
-    Ok(())
+    let now = Local::now().naive_local();
+    let acted = act_on_pending(&paths, &state, &pending, &[id], |notification| {
+        snooze(notification, minutes, now);
+        Ok(())
+    })?;
+    after_toast_action(&app, acted)
 }
 
 #[tauri::command]
@@ -596,21 +934,22 @@ fn snooze_tomorrow(
     pending: tauri::State<PendingState>,
     id: String,
 ) -> Result<(), String> {
-    {
-        let mut notifications = lock(&state.0, "lembretes")?;
-        let notification = notifications
-            .iter_mut()
-            .find(|item| item.id == id)
-            .ok_or_else(|| "Lembrete não encontrado.".to_string())?;
-        snooze_until_tomorrow(notification, Local::now().naive_local())?;
-        persist_notifications(&paths, &notifications)?;
-    }
-    lock(&pending.0, "alertas pendentes")?.retain(|item| item.id != id);
-    emit_main_changed(&app);
-    emit_queue_changed(&app);
-    Ok(())
+    let now = Local::now().naive_local();
+    let acted = act_on_pending(&paths, &state, &pending, &[id], |notification| {
+        snooze_until_tomorrow(notification, now)
+    })?;
+    after_toast_action(&app, acted)
 }
 
+fn pending_ids(pending: &PendingState) -> Result<Vec<String>, String> {
+    Ok(lock(&pending.0, "alertas pendentes")?
+        .iter()
+        .map(|item| item.id.clone())
+        .collect())
+}
+
+/// "Concluir todos" e "Adiar todos" agem só sobre os alertas que estavam na
+/// fila; um que chegue no meio da operação continua nela.
 #[tauri::command]
 fn mark_all_done(
     app: AppHandle,
@@ -618,23 +957,11 @@ fn mark_all_done(
     state: tauri::State<NotificationState>,
     pending: tauri::State<PendingState>,
 ) -> Result<(), String> {
-    let ids: Vec<String> = lock(&pending.0, "alertas pendentes")?
-        .iter()
-        .map(|item| item.id.clone())
-        .collect();
+    let ids = pending_ids(&pending)?;
     let now = Local::now().naive_local();
-
-    {
-        let mut notifications = lock(&state.0, "lembretes")?;
-        for notification in notifications
-            .iter_mut()
-            .filter(|item| ids.contains(&item.id))
-        {
-            advance_after(notification, now)?;
-        }
-        persist_notifications(&paths, &notifications)?;
-    }
-    lock(&pending.0, "alertas pendentes")?.clear();
+    act_on_pending(&paths, &state, &pending, &ids, |notification| {
+        advance_after(notification, now)
+    })?;
     emit_main_changed(&app);
     emit_queue_changed(&app);
     Ok(())
@@ -651,23 +978,12 @@ fn snooze_all(
     if !(1..=1_440).contains(&minutes) {
         return Err("O adiamento deve ficar entre 1 minuto e 24 horas.".to_string());
     }
-    let ids: Vec<String> = lock(&pending.0, "alertas pendentes")?
-        .iter()
-        .map(|item| item.id.clone())
-        .collect();
-
-    {
-        let now = Local::now().naive_local();
-        let mut notifications = lock(&state.0, "lembretes")?;
-        for notification in notifications
-            .iter_mut()
-            .filter(|item| ids.contains(&item.id))
-        {
-            snooze(notification, minutes, now);
-        }
-        persist_notifications(&paths, &notifications)?;
-    }
-    lock(&pending.0, "alertas pendentes")?.clear();
+    let ids = pending_ids(&pending)?;
+    let now = Local::now().naive_local();
+    act_on_pending(&paths, &state, &pending, &ids, |notification| {
+        snooze(notification, minutes, now);
+        Ok(())
+    })?;
     emit_main_changed(&app);
     emit_queue_changed(&app);
     Ok(())
@@ -686,25 +1002,46 @@ fn save_user_settings(
     settings: Settings,
 ) -> Result<(), String> {
     settings.validate()?;
-    if settings.start_with_windows {
-        app.autolaunch()
-            .enable()
-            .map_err(|error| error.to_string())?;
-    } else {
-        app.autolaunch()
-            .disable()
-            .map_err(|error| error.to_string())?;
-    }
+    ensure_writable(&paths.health.settings, "As configurações")?;
     save_settings(&paths.settings, &settings)?;
     *lock(&state.0, "configurações")? = settings.clone();
 
-    if let Some(toast) = app.get_webview_window("toast") {
-        let _ = toast.set_always_on_top(settings.alert_always_on_top);
-        let _ = toast.emit("settings-changed", settings.clone());
+    for label in ["toast", "snooze-menu", "custom-snooze"] {
+        let Some(window) = app.get_webview_window(label) else {
+            continue;
+        };
+        if let Err(error) = window.set_always_on_top(settings.alert_always_on_top) {
+            log(
+                &app,
+                &format!("Falha ao ajustar 'sempre no topo' em {label}: {error}"),
+            );
+        }
+        if let Err(error) = window.emit("settings-changed", settings.clone()) {
+            log(
+                &app,
+                &format!("Falha ao avisar {label} das configurações: {error}"),
+            );
+        }
     }
-    if let Some(menu) = app.get_webview_window("snooze-menu") {
-        let _ = menu.set_always_on_top(settings.alert_always_on_top);
-        let _ = menu.emit("settings-changed", settings);
+
+    // Em desenvolvimento, registrar o autostart apontaria o login do Windows
+    // para o executável de debug no lugar do instalado.
+    #[cfg(not(debug_assertions))]
+    {
+        let result = if settings.start_with_windows {
+            app.autolaunch().enable()
+        } else {
+            app.autolaunch().disable()
+        };
+        if let Err(error) = result {
+            log(
+                &app,
+                &format!("Falha ao ajustar o início com o Windows: {error}"),
+            );
+            return Err(format!(
+                "Configurações salvas, mas não foi possível ajustar o início com o Windows: {error}"
+            ));
+        }
     }
     Ok(())
 }
@@ -717,17 +1054,77 @@ fn get_snooze_target(state: tauri::State<SnoozeMenuState>) -> Result<String, Str
         .ok_or_else(|| "Nenhum lembrete selecionado.".to_string())
 }
 
+/// Posiciona um submenu ao lado da linha `anchor` do toast, dentro da área
+/// de trabalho do monitor do toast: acima da linha se couber, senão abaixo,
+/// sempre sem sair da tela. Tamanho e posição usam a escala DESTE monitor
+/// (a janela pode estar estacionada fora da tela, noutro DPI).
+fn place_beside_toast(
+    toast: &WebviewWindow,
+    window: &WebviewWindow,
+    anchor: &SnoozeMenuAnchor,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    const GAP: f64 = 6.0;
+    let toast_position = toast.outer_position().map_err(|error| error.to_string())?;
+    let monitor = toast
+        .monitor_from_point(f64::from(toast_position.x), f64::from(toast_position.y))
+        .map_err(|error| error.to_string())?
+        .or_else(|| toast.primary_monitor().ok().flatten())
+        .ok_or_else(|| "Não foi possível localizar o monitor.".to_string())?;
+    let scale = monitor.scale_factor();
+    let area = monitor.work_area();
+    let width_px = (width * scale).round() as i32;
+    let height_px = (height * scale).round() as i32;
+
+    let left = area.position.x;
+    let right = area.position.x + area.size.width as i32 - width_px;
+    let top = area.position.y;
+    let bottom = area.position.y + area.size.height as i32 - height_px;
+
+    let desired_x = toast_position.x + ((anchor.x + anchor.width - width) * scale).round() as i32;
+    let x = desired_x.min(right).max(left);
+    let above = toast_position.y + ((anchor.top - height - GAP) * scale).round() as i32;
+    let below = toast_position.y + ((anchor.bottom + GAP) * scale).round() as i32;
+    let y = if above >= top {
+        above
+    } else {
+        below.min(bottom).max(top)
+    };
+
+    let position = PhysicalPosition::new(x, y);
+    window
+        .set_position(position)
+        .map_err(|error| error.to_string())?;
+    window
+        .set_size(tauri::PhysicalSize::new(
+            width_px.max(1) as u32,
+            height_px.max(1) as u32,
+        ))
+        .map_err(|error| error.to_string())?;
+    // Mudar de monitor pode trocar o DPI e o Windows reposicionar a janela.
+    window
+        .set_position(position)
+        .map_err(|error| error.to_string())
+}
+
+fn is_pending(pending: &PendingState, id: &str) -> Result<bool, String> {
+    Ok(lock(&pending.0, "alertas pendentes")?
+        .iter()
+        .any(|item| item.id == id))
+}
+
 #[tauri::command]
 fn open_snooze_menu(
     app: AppHandle,
     state: tauri::State<SnoozeMenuState>,
     settings: tauri::State<SettingsState>,
+    pending: tauri::State<PendingState>,
     id: String,
     anchor: SnoozeMenuAnchor,
 ) -> Result<bool, String> {
     const WIDTH: f64 = 168.0;
     const HEIGHT: f64 = 190.0;
-    const GAP: f64 = 6.0;
 
     let toast = app
         .get_webview_window("toast")
@@ -735,66 +1132,55 @@ fn open_snooze_menu(
     let menu = app
         .get_webview_window("snooze-menu")
         .ok_or_else(|| "Menu de adiamento indisponível.".to_string())?;
-    let mut session = lock(&state.0, "menu de adiamento")?;
-    let same_target = session
-        .target_id
-        .as_ref()
-        .is_some_and(|target| target == &id);
-    if same_target && session.visible {
-        session.visible = false;
-        drop(session);
-        menu.hide().map_err(|error| error.to_string())?;
-        let _ = menu.set_position(PhysicalPosition::new(-10_000, -10_000));
-        log(&app, "Menu de adiamento: fechado pelo toggle.");
-        return Ok(false);
-    }
-    session.target_id = Some(id);
-    session.visible = true;
-    drop(session);
-    let toast_position = toast.outer_position().map_err(|error| error.to_string())?;
-    let scale = toast.scale_factor().map_err(|error| error.to_string())?;
-    let monitor = toast
-        .monitor_from_point(f64::from(toast_position.x), f64::from(toast_position.y))
-        .map_err(|error| error.to_string())?
-        .or_else(|| toast.primary_monitor().ok().flatten())
-        .ok_or_else(|| "Não foi possível localizar o monitor.".to_string())?;
-    let work_area = monitor.work_area();
-
-    let desired_x = toast_position.x + ((anchor.x + anchor.width - WIDTH) * scale).round() as i32;
-    let menu_width = (WIDTH * scale).round() as i32;
-    let min_x = work_area.position.x;
-    let max_x = work_area.position.x + work_area.size.width as i32 - menu_width;
-    let x = desired_x.clamp(min_x, max_x);
-    let above = toast_position.y + ((anchor.top - HEIGHT - GAP) * scale).round() as i32;
-    let below = toast_position.y + ((anchor.bottom + GAP) * scale).round() as i32;
-    let y = if above >= work_area.position.y {
-        above
-    } else {
-        below
-    };
-
-    menu.set_size(tauri::LogicalSize::new(WIDTH, HEIGHT))
-        .map_err(|error| error.to_string())?;
-    menu.set_position(PhysicalPosition::new(x, y))
-        .map_err(|error| error.to_string())?;
-    let always_on_top = lock(&settings.0, "configurações")?.alert_always_on_top;
-    if let Err(error) = show_without_activation(&menu, always_on_top) {
-        if let Ok(mut session) = lock(&state.0, "menu de adiamento") {
+    {
+        let mut session = lock(&state.0, "menu de adiamento")?;
+        let same_target = session
+            .target_id
+            .as_ref()
+            .is_some_and(|target| target == &id);
+        if same_target && session.visible {
             session.visible = false;
+            session.opened_at = None;
+            drop(session);
+            menu.hide().map_err(|error| error.to_string())?;
+            if let Err(error) = menu.set_position(PhysicalPosition::new(-10_000, -10_000)) {
+                log(
+                    &app,
+                    &format!("Falha ao estacionar o menu de adiamento: {error}"),
+                );
+            }
+            log(&app, "Menu de adiamento: fechado pelo toggle.");
+            return Ok(false);
         }
-        return Err(error);
+    }
+    if !is_pending(&pending, &id)? {
+        return Err(NOT_PENDING.to_string());
+    }
+
+    place_beside_toast(&toast, &menu, &anchor, WIDTH, HEIGHT)?;
+    let always_on_top = lock(&settings.0, "configurações")?.alert_always_on_top;
+    show_without_activation(&menu, always_on_top)?;
+    // Só marca como aberto depois de aparecer: um erro no meio deixava o
+    // estado "visível" preso e o watchdog do toast desligado.
+    {
+        let mut session = lock(&state.0, "menu de adiamento")?;
+        session.target_id = Some(id);
+        session.visible = true;
+        session.opened_at = Some(Instant::now());
+    }
+    if let Err(error) = menu.emit("snooze-menu-open", ()) {
+        log(
+            &app,
+            &format!("Menu de adiamento: falha ao avisar abertura: {error}"),
+        );
     }
     log(&app, "Menu de adiamento: aberto pelo toggle.");
     Ok(true)
 }
 
 #[tauri::command]
-fn hide_snooze_menu(app: AppHandle, state: tauri::State<SnoozeMenuState>) -> Result<(), String> {
-    lock(&state.0, "menu de adiamento")?.visible = false;
-    if let Some(menu) = app.get_webview_window("snooze-menu") {
-        menu.hide().map_err(|error| error.to_string())?;
-        let _ = menu.set_position(PhysicalPosition::new(-10_000, -10_000));
-    }
+fn hide_snooze_menu(app: AppHandle) -> Result<(), String> {
+    hide_snooze_menu_window(&app);
     log(&app, "Menu de adiamento: fechado explicitamente.");
     Ok(())
 }
@@ -804,12 +1190,12 @@ fn open_custom_snooze(
     app: AppHandle,
     state: tauri::State<CustomSnoozeState>,
     settings: tauri::State<SettingsState>,
+    pending: tauri::State<PendingState>,
     id: String,
     anchor: SnoozeMenuAnchor,
 ) -> Result<bool, String> {
     const WIDTH: f64 = 300.0;
     const HEIGHT: f64 = 430.0;
-    const GAP: f64 = 6.0;
 
     let toast = app
         .get_webview_window("toast")
@@ -817,41 +1203,14 @@ fn open_custom_snooze(
     let window = app
         .get_webview_window("custom-snooze")
         .ok_or_else(|| "Janela de personalização indisponível.".to_string())?;
-
-    {
-        let mut session = lock(&state.0, "personalizar adiamento")?;
-        session.target_id = Some(id);
-        session.visible = true;
+    if !is_pending(&pending, &id)? {
+        return Err(NOT_PENDING.to_string());
     }
 
-    let toast_position = toast.outer_position().map_err(|error| error.to_string())?;
-    let scale = toast.scale_factor().map_err(|error| error.to_string())?;
-    let monitor = toast
-        .monitor_from_point(f64::from(toast_position.x), f64::from(toast_position.y))
-        .map_err(|error| error.to_string())?
-        .or_else(|| toast.primary_monitor().ok().flatten())
-        .ok_or_else(|| "Não foi possível localizar o monitor.".to_string())?;
-    let work_area = monitor.work_area();
-
-    let desired_x = toast_position.x + ((anchor.x + anchor.width - WIDTH) * scale).round() as i32;
-    let menu_width = (WIDTH * scale).round() as i32;
-    let min_x = work_area.position.x;
-    let max_x = work_area.position.x + work_area.size.width as i32 - menu_width;
-    let x = desired_x.clamp(min_x, max_x);
-    let above = toast_position.y + ((anchor.top - HEIGHT - GAP) * scale).round() as i32;
-    let below = toast_position.y + ((anchor.bottom + GAP) * scale).round() as i32;
-    let y = if above >= work_area.position.y {
-        above
-    } else {
-        below
-    };
-
-    window
-        .set_size(tauri::LogicalSize::new(WIDTH, HEIGHT))
-        .map_err(|error| error.to_string())?;
-    window
-        .set_position(PhysicalPosition::new(x, y))
-        .map_err(|error| error.to_string())?;
+    // O alvo é gravado antes de exibir: o frontend o consulta ao receber
+    // "custom-snooze-open".
+    lock(&state.0, "personalizar adiamento")?.target_id = Some(id);
+    place_beside_toast(&toast, &window, &anchor, WIDTH, HEIGHT)?;
 
     let always_on_top = lock(&settings.0, "configurações")?.alert_always_on_top;
     // Primeiro exibe sem ativação — é o que garante que a janela apareça e
@@ -860,12 +1219,22 @@ fn open_custom_snooze(
     // funcionar (digitar a data, Enter confirmar, Esc fechar). Se o foco falhar,
     // a janela continua utilizável no mouse.
     show_without_activation(&window, always_on_top)?;
+    {
+        let mut session = lock(&state.0, "personalizar adiamento")?;
+        session.visible = true;
+        session.opened_at = Some(Instant::now());
+    }
     if let Err(error) = window.set_focus() {
         log(&app, &format!("Personalizar: sem foco de teclado: {error}"));
     }
     // A janela é reutilizada: avisa o frontend para resetar (botão habilitado,
     // sugestão de horário fresca) a cada abertura.
-    let _ = app.emit("custom-snooze-open", ());
+    if let Err(error) = app.emit("custom-snooze-open", ()) {
+        log(
+            &app,
+            &format!("Personalizar: falha ao avisar abertura: {error}"),
+        );
+    }
 
     log(&app, "Personalizar adiamento: aberto.");
     Ok(true)
@@ -885,15 +1254,8 @@ fn get_custom_snooze_target(
 }
 
 #[tauri::command]
-fn hide_custom_snooze(
-    app: AppHandle,
-    state: tauri::State<CustomSnoozeState>,
-) -> Result<(), String> {
-    lock(&state.0, "personalizar adiamento")?.visible = false;
-    if let Some(window) = app.get_webview_window("custom-snooze") {
-        window.hide().map_err(|error| error.to_string())?;
-        let _ = window.set_position(PhysicalPosition::new(-10_000, -10_000));
-    }
+fn hide_custom_snooze(app: AppHandle) -> Result<(), String> {
+    hide_custom_snooze_window(&app);
     log(&app, "Personalizar adiamento: fechado.");
     Ok(())
 }
@@ -920,22 +1282,19 @@ fn reschedule_notification(
         .map_err(|_| "Data e hora inválidas.".to_string())?;
     let now = Local::now().naive_local();
 
-    {
-        let mut list = lock(&notifications.0, "lembretes")?;
-        let notification = list
-            .iter_mut()
-            .find(|item| item.id == id)
-            .ok_or_else(|| "Lembrete não encontrado.".to_string())?;
-        reschedule_to(notification, target, now)?;
-        persist_notifications(&paths, &list)?;
+    let acted = act_on_pending(&paths, &notifications, &pending, &[id], |notification| {
+        reschedule_to(notification, target, now)
+    })?;
+    if acted > 0 {
+        log(&app, "Personalizar: reagendado com sucesso.");
+    } else {
+        log(
+            &app,
+            "Personalizar: recusado, o lembrete já não estava na fila.",
+        );
+        hide_custom_snooze_window(&app);
     }
-
-    lock(&pending.0, "alertas pendentes")?.retain(|item| item.id != id);
-
-    log(&app, "Personalizar: reagendado com sucesso.");
-    emit_main_changed(&app);
-    emit_queue_changed(&app);
-    Ok(())
+    after_toast_action(&app, acted)
 }
 
 #[tauri::command]
@@ -955,7 +1314,7 @@ fn minimize_main_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_main_from_toast(app: AppHandle) -> Result<(), String> {
+async fn open_main_from_toast(app: AppHandle) -> Result<(), String> {
     open_main_window(&app)?;
     // Abrir o Noast não é uma decisão sobre o lembrete: o alerta segue pendente,
     // então o toast permanece visível (só fecha os submenus de adiamento).
@@ -1038,11 +1397,18 @@ fn position_toast(
     let x = area.position.x + area.size.width as i32 - width_px - margin_px;
     let y = area.position.y + area.size.height as i32 - height_px - margin_px;
 
+    // Posição antes do tamanho, e tamanho em pixels físicos do monitor de
+    // destino: um LogicalSize seria convertido pela escala do lugar onde a
+    // janela estava estacionada, que pode ter outro DPI.
+    let position = PhysicalPosition::new(x, y);
     window
-        .set_size(tauri::LogicalSize::new(WIDTH, height))
+        .set_position(position)
         .map_err(|error| error.to_string())?;
     window
-        .set_position(PhysicalPosition::new(x, y))
+        .set_size(tauri::PhysicalSize::new(width_px as u32, height_px as u32))
+        .map_err(|error| error.to_string())?;
+    window
+        .set_position(position)
         .map_err(|error| error.to_string())?;
     window
         .set_always_on_top(settings.alert_always_on_top)
@@ -1138,10 +1504,20 @@ fn create_custom_snooze_window(
 }
 
 fn open_main_window(app: &AppHandle) -> Result<(), String> {
+    open_main_window_reporting(app).map(|_| ())
+}
+
+/// Abre (ou traz de volta) a janela principal. Devolve `true` se ela acabou de
+/// ser criada — o webview ainda vai carregar e não ouve eventos.
+fn open_main_window_reporting(app: &AppHandle) -> Result<bool, String> {
     if let Some(window) = app.get_webview_window("main") {
+        // show() numa janela minimizada não faz nada (ela já é "visível").
+        if window.is_minimized().unwrap_or(false) {
+            window.unminimize().map_err(|error| error.to_string())?;
+        }
         window.show().map_err(|error| error.to_string())?;
         window.set_focus().map_err(|error| error.to_string())?;
-        return Ok(());
+        return Ok(false);
     }
 
     let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
@@ -1155,15 +1531,65 @@ fn open_main_window(app: &AppHandle) -> Result<(), String> {
         .build()
         .map_err(|error| format!("Falha ao criar janela principal: {error}"))?;
     window.show().map_err(|error| error.to_string())?;
-    window.set_focus().map_err(|error| error.to_string())
+    window.set_focus().map_err(|error| error.to_string())?;
+    Ok(true)
 }
 
 fn open_new_reminder(app: &AppHandle) -> Result<(), String> {
-    open_main_window(app)?;
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.emit("open-new-reminder", ());
+    // Guardado sempre: a janela pode existir mas ainda estar carregando (logo
+    // após o startup) e perder o evento. O frontend consome o pedido tanto ao
+    // terminar de carregar quanto ao receber o evento.
+    if let Some(request) = app.try_state::<NewReminderRequest>() {
+        request.0.store(true, Ordering::SeqCst);
+    }
+    let created = open_main_window_reporting(app)?;
+    if !created {
+        if let Some(window) = app.get_webview_window("main") {
+            if let Err(error) = window.emit("open-new-reminder", ()) {
+                log(app, &format!("Falha ao pedir novo lembrete: {error}"));
+            }
+        }
     }
     Ok(())
+}
+
+/// "Sair" da bandeja: dá à janela principal a chance de gravar o que está
+/// pendente (autosave das notas) antes de encerrar. Ela responde com
+/// `ready_to_quit`; se não responder a tempo, encerra assim mesmo.
+fn request_quit(app: &AppHandle) {
+    const GRACE: Duration = Duration::from_millis(2_000);
+    clear_pending_secret(app);
+    let Some(window) = app.get_webview_window("main") else {
+        app.exit(0);
+        return;
+    };
+    if window.emit("app-quitting", ()).is_err() {
+        app.exit(0);
+        return;
+    }
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(GRACE);
+        log(
+            &handle,
+            "Saída: a janela principal não confirmou a tempo; encerrando.",
+        );
+        handle.exit(0);
+    });
+}
+
+#[tauri::command]
+fn ready_to_quit(app: AppHandle) {
+    clear_pending_secret(&app);
+    app.exit(0);
+}
+
+/// Consome o pedido de "Novo lembrete" feito pela bandeja. O frontend chama ao
+/// terminar de carregar e também ao receber o evento, então o pedido nunca é
+/// atendido duas vezes nem se perde.
+#[tauri::command]
+fn take_new_reminder_request(request: tauri::State<NewReminderRequest>) -> bool {
+    request.0.swap(false, Ordering::SeqCst)
 }
 
 /// Mostra a janela do toast num tamanho padrão; o frontend refina altura e
@@ -1206,10 +1632,36 @@ fn show_toast_window(app: &AppHandle, reason: &'static str) {
 }
 
 fn enqueue_alert(app: &AppHandle, notification: Notification) {
-    let Some(pending) = app.try_state::<PendingState>() else {
+    let (Some(pending), Some(notifications)) = (
+        app.try_state::<PendingState>(),
+        app.try_state::<NotificationState>(),
+    ) else {
         log(app, "Fila de alertas indisponível.");
         return;
     };
+    // Trava lembretes → fila (a ordem de `act_on_pending`) e confere que o
+    // lembrete ainda existe como disparado: entre a coleta e aqui ele pode ter
+    // sido excluído, concluído ou editado pela janela principal.
+    let notifications = match lock(&notifications.0, "lembretes") {
+        Ok(notifications) => notifications,
+        Err(error) => {
+            log(app, &error);
+            return;
+        }
+    };
+    let still_due = notifications.iter().any(|item| {
+        item.id == notification.id && !item.done && item.last_fired == notification.last_fired
+    });
+    if !still_due {
+        log(
+            app,
+            &format!(
+                "Disparo descartado: \"{}\" mudou antes de entrar na fila.",
+                notification.text
+            ),
+        );
+        return;
+    }
     let mut queue = match lock(&pending.0, "alertas pendentes") {
         Ok(queue) => queue,
         Err(error) => {
@@ -1231,6 +1683,7 @@ fn enqueue_alert(app: &AppHandle, notification: Notification) {
         queue.push(notification);
     }
     drop(queue);
+    drop(notifications);
     if should_notify {
         let sound_enabled = app
             .try_state::<SettingsState>()
@@ -1294,10 +1747,14 @@ fn collect_due(
     }
 
     if !due.is_empty() {
+        // Mesmo sem conseguir gravar, o alerta é mostrado: descartá-lo com o
+        // disparo já marcado na memória o fazia sumir até reiniciar. No pior
+        // caso ele volta a tocar na próxima abertura.
         if let Err(error) = persist_notifications(paths, &notifications) {
             log(app, &format!("Falha ao persistir disparos: {error}"));
-            return Vec::new();
         }
+        drop(notifications);
+        emit_main_changed(app);
     }
     due
 }
@@ -1318,32 +1775,67 @@ fn ensure_toast_presented(app: &AppHandle, unanswered_nudges: &mut u32) {
         *unanswered_nudges = 0;
         return;
     }
+    let blocks = |opened_at: Option<Instant>, visible: bool| {
+        visible && opened_at.is_some_and(|since| since.elapsed() < SUBMENU_GRACE)
+    };
     let submenu_open = app
         .try_state::<SnoozeMenuState>()
-        .and_then(|s| lock(&s.0, "menu de adiamento").ok().map(|v| v.visible))
+        .and_then(|s| {
+            lock(&s.0, "menu de adiamento")
+                .ok()
+                .map(|v| blocks(v.opened_at, v.visible))
+        })
         .unwrap_or(false)
         || app
             .try_state::<CustomSnoozeState>()
-            .and_then(|s| lock(&s.0, "personalizar adiamento").ok().map(|v| v.visible))
+            .and_then(|s| {
+                lock(&s.0, "personalizar adiamento")
+                    .ok()
+                    .map(|v| blocks(v.opened_at, v.visible))
+            })
             .unwrap_or(false);
     if submenu_open {
         *unanswered_nudges = 0;
         return;
     }
     let Some(toast) = app.get_webview_window("toast") else {
+        // A janela foi destruída (não deveria: o fechamento é bloqueado).
+        // Recria; o webview novo consulta a fila ao carregar.
+        log(app, "Watchdog: janela do toast ausente; recriando.");
+        on_main_thread(app, "recriação do toast", |handle| {
+            let Some(settings) = handle
+                .try_state::<SettingsState>()
+                .and_then(|s| lock(&s.0, "configurações").ok().map(|value| value.clone()))
+            else {
+                return;
+            };
+            if let Err(error) = create_toast_window(handle, &settings) {
+                log(handle, &format!("Falha ao recriar o toast: {error}"));
+            }
+        });
         return;
     };
     if toast.is_visible().unwrap_or(false) {
         *unanswered_nudges = 0;
-        let always_on_top = app
-            .try_state::<SettingsState>()
-            .and_then(|s| {
-                lock(&s.0, "configurações")
-                    .ok()
-                    .map(|v| v.alert_always_on_top)
-            })
-            .unwrap_or(true);
-        let _ = show_without_activation(&toast, always_on_top);
+        on_main_thread(app, "reafirmação do toast", |handle| {
+            let Some(toast) = handle.get_webview_window("toast") else {
+                return;
+            };
+            let always_on_top = handle
+                .try_state::<SettingsState>()
+                .and_then(|s| {
+                    lock(&s.0, "configurações")
+                        .ok()
+                        .map(|v| v.alert_always_on_top)
+                })
+                .unwrap_or(true);
+            if let Err(error) = show_without_activation(&toast, always_on_top) {
+                log(
+                    handle,
+                    &format!("Watchdog: falha ao reafirmar o toast: {error}"),
+                );
+            }
+        });
         return;
     }
     *unanswered_nudges += 1;
@@ -1352,7 +1844,9 @@ fn ensure_toast_presented(app: &AppHandle, unanswered_nudges: &mut u32) {
         show_toast_window(app, "watchdog: frontend sem resposta aos avisos");
         return;
     }
-    let _ = toast.emit("queue-updated", ());
+    if let Err(error) = toast.emit("queue-updated", ()) {
+        log(app, &format!("Watchdog: falha ao avisar o toast: {error}"));
+    }
     log(
         app,
         &format!(
@@ -1376,7 +1870,7 @@ fn start_scheduler(app: AppHandle, state: NotificationState, paths: Paths) {
             // Heartbeat a cada ~10 min (40 ticks de 15s): confirma que a thread
             // do scheduler continua viva mesmo após dias de app ligado.
             ticks += 1;
-            if ticks % 40 == 0 {
+            if ticks.is_multiple_of(40) {
                 let queued = app
                     .try_state::<PendingState>()
                     .and_then(|pending| lock(&pending.0, "alertas pendentes").ok().map(|q| q.len()))
@@ -1398,7 +1892,10 @@ async fn check_for_update(app: AppHandle) -> Result<Option<String>, String> {
     let updater = app.updater().map_err(|error| error.to_string())?;
     match updater.check().await {
         Ok(Some(update)) => {
-            log(&app, &format!("Atualização disponível: {}.", update.version));
+            log(
+                &app,
+                &format!("Atualização disponível: {}.", update.version),
+            );
             Ok(Some(update.version))
         }
         Ok(None) => {
@@ -1426,17 +1923,106 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
         .map_err(|error| format!("Não foi possível verificar atualizações: {error}"))?
         .ok_or_else(|| "O Noast já está atualizado.".to_string())?;
 
-    log(&app, &format!("Instalando atualização {}...", update.version));
-    update
-        .download_and_install(|_chunk, _total| {}, || {})
+    log(&app, &format!("Baixando atualização {}...", update.version));
+    // `download` confere a assinatura; a instalação fica com o Noast. O
+    // `install` do plugin encerra o processo mesmo quando o usuário recusa o
+    // pedido de administrador (UAC) — e os lembretes paravam até o próximo login.
+    let bytes = update
+        .download(|_chunk, _total| {}, || {})
         .await
         .map_err(|error| {
-            log(&app, &format!("Atualização: falha ao instalar: {error}"));
-            format!("Não foi possível instalar a atualização: {error}")
+            log(&app, &format!("Atualização: falha ao baixar: {error}"));
+            format!("Não foi possível baixar a atualização: {error}")
         })?;
+    let version = update.version.clone();
+    let launched = tauri::async_runtime::spawn_blocking(move || launch_installer(&version, &bytes))
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = launched {
+        log(
+            &app,
+            &format!("Atualização: instalador não iniciado: {error}"),
+        );
+        return Err(error);
+    }
 
-    log(&app, "Atualização instalada; reiniciando o Noast.");
-    app.restart();
+    // O instalador está rodando e vai fechar e reabrir o Noast. Um segredo
+    // copiado há menos de 30 s não pode ficar na área de transferência.
+    on_main_thread(&app, "encerramento para atualizar", |handle| {
+        clear_pending_secret(handle);
+        log(
+            handle,
+            "Atualização: instalador iniciado; encerrando o Noast.",
+        );
+        handle.exit(0);
+    });
+    Ok(())
+}
+
+/// Grava o instalador baixado (já verificado) e o executa como o plugin faria
+/// (`/P` passivo, `/R` reabre o app, `/UPDATE`), mas esperando a resposta do
+/// UAC: recusado, o Noast continua aberto e avisa o usuário.
+#[cfg(target_os = "windows")]
+fn launch_installer(version: &str, bytes: &[u8]) -> Result<(), String> {
+    use windows::core::{w, HSTRING, PCWSTR};
+    use windows::Win32::Foundation::ERROR_CANCELLED;
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
+
+    if !bytes.starts_with(b"MZ") {
+        return Err("O pacote de atualização não é um instalador do Windows.".to_string());
+    }
+    let path = std::env::temp_dir().join(format!("Noast_{version}_x64-setup.exe"));
+    std::fs::write(&path, bytes)
+        .map_err(|error| format!("Não foi possível salvar o instalador: {error}"))?;
+
+    let file = HSTRING::from(path.as_os_str());
+    let parameters = HSTRING::from("/P /R /UPDATE");
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC,
+        lpVerb: w!("open"),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(parameters.as_ptr()),
+        nShow: SW_SHOW.0,
+        ..Default::default()
+    };
+    unsafe {
+        // O ShellExecuteEx pede COM inicializado no thread que o chama.
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let result = ShellExecuteExW(&mut info);
+        if com.is_ok() {
+            CoUninitialize();
+        }
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.code() == ERROR_CANCELLED.to_hresult() => Err(
+                "A instalação foi cancelada na permissão do Windows. O Noast continua aberto."
+                    .to_string(),
+            ),
+            Err(error) => Err(format!("Não foi possível iniciar o instalador: {error}")),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn launch_installer(_version: &str, _bytes: &[u8]) -> Result<(), String> {
+    Err("A atualização automática está disponível apenas no Windows.".to_string())
+}
+
+/// Problemas de leitura na abertura (arquivo danificado, bloqueado), para a
+/// janela principal avisar o usuário.
+#[tauri::command]
+fn get_load_warnings(paths: tauri::State<Paths>) -> Vec<String> {
+    paths
+        .health
+        .notices
+        .lock()
+        .map(|notices| notices.clone())
+        .unwrap_or_default()
 }
 
 /// Versão em execução, para exibir nas configurações.
@@ -1445,102 +2031,59 @@ fn app_version(app: AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
-/// Instalar reinicia o aplicativo, então só é aceitável quando o usuário não
-/// está no meio de algo: sem alertas na fila e com a janela principal fechada
-/// (o uso normal é pela bandeja). Caso contrário, a atualização espera a
-/// próxima rodada.
-#[cfg(desktop)]
-fn safe_to_install_update(app: &AppHandle) -> Result<(), &'static str> {
-    let busy_queue = app
-        .try_state::<PendingState>()
-        .and_then(|pending| lock(&pending.0, "alertas pendentes").ok().map(|q| !q.is_empty()))
-        .unwrap_or(false);
-    if busy_queue {
-        return Err("há lembretes na fila");
-    }
-    let main_open = app
-        .get_webview_window("main")
-        .and_then(|window| window.is_visible().ok())
-        .unwrap_or(false);
-    if main_open {
-        return Err("a janela principal está aberta");
-    }
-    Ok(())
+/// Versão nova já detectada, para a janela principal mostrar o aviso ao abrir.
+#[tauri::command]
+fn get_available_update(available: tauri::State<AvailableUpdate>) -> Option<String> {
+    available.0.lock().ok().and_then(|value| value.clone())
 }
 
-/// Verifica periodicamente se há versão nova publicada nos Releases e, havendo,
-/// baixa e instala em um momento seguro. A verificação se repete enquanto o app
-/// estiver aberto — ficar dias ligado é o uso normal, e só checar no startup
-/// deixaria essas sessões sem nunca atualizar. Cada passo é registrado no log.
+/// Verifica periodicamente se há versão nova publicada nos Releases e avisa a
+/// janela principal. NÃO instala sozinho: o instalador pede elevação (UAC), e
+/// um prompt surgindo do nada — ou negado com ninguém no PC — encerrava o
+/// Noast e parava os lembretes. Quem instala é o usuário, pelo aviso.
 #[cfg(desktop)]
 fn start_update_check(app: AppHandle) {
     use tauri_plugin_updater::UpdaterExt;
 
-    use std::time::Duration;
-
     const FIRST_CHECK: Duration = Duration::from_secs(20);
     const INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
-    // Quando há atualização mas o momento é ruim, tenta de novo mais cedo.
-    const RETRY: Duration = Duration::from_secs(15 * 60);
 
     std::thread::spawn(move || {
         // Respiro para o app terminar de abrir antes de usar rede/disco.
         std::thread::sleep(FIRST_CHECK);
         loop {
             let app = app.clone();
-            let postponed = tauri::async_runtime::block_on(async move {
+            tauri::async_runtime::block_on(async move {
                 let updater = match app.updater() {
                     Ok(updater) => updater,
                     Err(error) => {
                         log(&app, &format!("Atualizador indisponível: {error}"));
-                        return false;
+                        return;
                     }
                 };
-
-                let update = match updater.check().await {
-                    Ok(Some(update)) => update,
-                    Ok(None) => return false,
-                    Err(error) => {
-                        log(&app, &format!("Atualização: falha ao verificar: {error}"));
-                        return false;
+                match updater.check().await {
+                    Ok(Some(update)) => {
+                        log(
+                            &app,
+                            &format!(
+                                "Atualização disponível: {} (atual: {}). Aguardando o usuário.",
+                                update.version, update.current_version
+                            ),
+                        );
+                        if let Some(available) = app.try_state::<AvailableUpdate>() {
+                            if let Ok(mut value) = available.0.lock() {
+                                *value = Some(update.version.clone());
+                            }
+                        }
+                        if let Err(error) = app.emit("update-available", update.version.clone()) {
+                            log(&app, &format!("Falha ao avisar da atualização: {error}"));
+                        }
                     }
-                };
-
-                // Avisa a janela principal de qualquer forma: assim o usuário vê
-                // que há versão nova e pode atualizar na hora, sem esperar o
-                // momento seguro nem descobrir pelo log.
-                let _ = app.emit("update-available", update.version.clone());
-
-                if let Err(reason) = safe_to_install_update(&app) {
-                    log(
-                        &app,
-                        &format!(
-                            "Atualização {} disponível, adiada porque {reason}.",
-                            update.version
-                        ),
-                    );
-                    return true;
+                    Ok(None) => {}
+                    Err(error) => log(&app, &format!("Atualização: falha ao verificar: {error}")),
                 }
-
-                log(
-                    &app,
-                    &format!(
-                        "Atualização disponível: {} (atual: {}). Baixando...",
-                        update.version, update.current_version
-                    ),
-                );
-
-                match update.download_and_install(|_chunk, _total| {}, || {}).await {
-                    Ok(()) => {
-                        log(&app, "Atualização instalada; reiniciando o Noast.");
-                        app.restart();
-                    }
-                    Err(error) => log(&app, &format!("Atualização: falha ao instalar: {error}")),
-                }
-                false
             });
-
-            std::thread::sleep(if postponed { RETRY } else { INTERVAL });
+            std::thread::sleep(INTERVAL);
         }
     });
 }
@@ -1570,7 +2113,6 @@ pub fn run() {
             {
                 app.handle()
                     .plugin(tauri_plugin_updater::Builder::new().build())?;
-                start_update_check(app.handle().clone());
             }
             let paths = Paths {
                 notifications: notifications_path(app.handle()),
@@ -1578,13 +2120,63 @@ pub fn run() {
                 vault: vault_path(app.handle()),
                 settings: settings_path(app.handle()),
                 log: log_path(app.handle()),
+                health: Arc::new(StoreHealth::default()),
             };
             install_panic_hook(paths.log.clone());
 
-            let notifications = load_notifications(&paths.notifications).unwrap_or_else(|error| {
-                append_log(&paths.log, &error);
-                Vec::new()
-            });
+            // Nenhuma falha de leitura derruba o app: os lembretes são o
+            // essencial. Arquivo corrompido (já preservado à parte) → segue
+            // vazio; arquivo ilegível → segue vazio SEM gravar por cima.
+            // Tudo que der errado aqui também vira aviso na janela principal
+            // (get_load_warnings): sem isso a sessão seguia com a lista vazia
+            // e o usuário só descobria ao tentar salvar.
+            let notice = |text: String| {
+                if let Ok(mut notices) = paths.health.notices.lock() {
+                    notices.push(text);
+                }
+            };
+            let block = |slot: &Mutex<Option<String>>, what: &str, error: &LoadError| {
+                append_log(&paths.log, error.message());
+                match error {
+                    LoadError::Unreadable(reason) => {
+                        if let Ok(mut value) = slot.lock() {
+                            *value = Some(reason.clone());
+                        }
+                        notice(format!(
+                            "Não foi possível ler o arquivo de {what}. Para não apagar nada, as alterações não serão salvas nesta sessão — reinicie o Noast."
+                        ));
+                    }
+                    LoadError::Corrupt(_) => notice(format!(
+                        "O arquivo de {what} estava danificado e foi guardado à parte (detalhes no noast.log). O Noast começou sem esses dados."
+                    )),
+                }
+            };
+            // Veio do backup porque o principal estava ilegível: mostra, mas
+            // não grava por cima do principal (provavelmente mais novo).
+            let read_only = |slot: &Mutex<Option<String>>, what: &str, reason: Option<String>| {
+                if let Some(reason) = reason {
+                    notice(format!(
+                        "O arquivo de {what} estava bloqueado e foi aberto da cópia de segurança. As alterações não serão salvas nesta sessão — reinicie o Noast."
+                    ));
+                    append_log(
+                        &paths.log,
+                        &format!("Somente leitura nesta sessão: {reason}"),
+                    );
+                    if let Ok(mut value) = slot.lock() {
+                        *value = Some(reason);
+                    }
+                }
+            };
+            let notifications = match load_notifications(&paths.notifications, &paths.log) {
+                Ok(loaded) => {
+                    read_only(&paths.health.notifications, "lembretes", loaded.read_only);
+                    loaded.value
+                }
+                Err(error) => {
+                    block(&paths.health.notifications, "lembretes", &error);
+                    Vec::new()
+                }
+            };
             append_log(
                 &paths.log,
                 &format!(
@@ -1593,16 +2185,46 @@ pub fn run() {
                     paths.notifications.display()
                 ),
             );
-            let notes = load_notes(&paths.notes).unwrap_or_else(|error| {
-                append_log(&paths.log, &error);
-                Vec::new()
-            });
-            let vault = vault::load(&paths.vault).map_err(std::io::Error::other)?;
-            let settings = load_settings(&paths.settings).unwrap_or_else(|error| {
-                append_log(&paths.log, &error);
-                Settings::default()
-            });
-            settings.validate().map_err(std::io::Error::other)?;
+            let notes = match load_notes(&paths.notes, &paths.log) {
+                Ok(loaded) => {
+                    read_only(&paths.health.notes, "notas", loaded.read_only);
+                    loaded.value
+                }
+                Err(error) => {
+                    block(&paths.health.notes, "notas", &error);
+                    Vec::new()
+                }
+            };
+            let vault = match vault::load(&paths.vault, &paths.log) {
+                Ok((vault, reason)) => {
+                    read_only(&paths.health.vault, "cofre", reason);
+                    vault
+                }
+                Err(error) => {
+                    append_log(&paths.log, &format!("Cofre indisponível: {error}"));
+                    if let Ok(mut value) = paths.health.vault.lock() {
+                        *value = Some(error);
+                    }
+                    Vault::default()
+                }
+            };
+            let mut settings = match load_settings(&paths.settings, &paths.log) {
+                Ok(loaded) => {
+                    read_only(&paths.health.settings, "configurações", loaded.read_only);
+                    loaded.value
+                }
+                Err(error) => {
+                    block(&paths.health.settings, "configurações", &error);
+                    Settings::default()
+                }
+            };
+            if let Err(error) = settings.validate() {
+                append_log(
+                    &paths.log,
+                    &format!("Configurações inválidas ({error}); usando os padrões."),
+                );
+                settings = Settings::default();
+            }
 
             let notification_state = NotificationState(Arc::new(Mutex::new(notifications)));
             let note_state = NoteState(Arc::new(Mutex::new(notes)));
@@ -1622,13 +2244,22 @@ pub fn run() {
             app.manage(settings_state);
             app.manage(snooze_menu_state);
             app.manage(custom_snooze_state);
+            app.manage(NewReminderRequest::default());
+            app.manage(AvailableUpdate::default());
+            app.manage(PendingSecret::default());
 
             #[cfg(not(debug_assertions))]
             {
-                if settings.start_with_windows {
-                    let _ = app.autolaunch().enable();
+                let result = if settings.start_with_windows {
+                    app.autolaunch().enable()
                 } else {
-                    let _ = app.autolaunch().disable();
+                    app.autolaunch().disable()
+                };
+                if let Err(error) = result {
+                    append_log(
+                        &paths.log,
+                        &format!("Falha ao sincronizar o início com o Windows: {error}"),
+                    );
                 }
             }
 
@@ -1688,7 +2319,7 @@ pub fn run() {
                         log(&menu_handle, &error);
                     }
                 }
-                "quit" => menu_handle.exit(0),
+                "quit" => request_quit(&menu_handle),
                 _ => {}
             });
 
@@ -1696,6 +2327,8 @@ pub fn run() {
                 enqueue_alert(app.handle(), notification);
             }
             start_scheduler(app.handle().clone(), notification_state, paths);
+            #[cfg(desktop)]
+            start_update_check(app.handle().clone());
 
             if !std::env::args().any(|argument| argument == "--minimized") {
                 open_main_window(app.handle()).map_err(std::io::Error::other)?;
@@ -1703,11 +2336,42 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() == "main" {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    let _ = window.hide();
-                    api.prevent_close();
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            // Nenhuma janela do Noast é destruída: Alt+F4 no toast o destruía
+            // e os alertas seguintes nunca mais apareciam.
+            api.prevent_close();
+            let app = window.app_handle();
+            match window.label() {
+                "main" => {
+                    if let Err(error) = window.hide() {
+                        log(
+                            app,
+                            &format!("Falha ao ocultar a janela principal: {error}"),
+                        );
+                    }
                 }
+                "snooze-menu" => hide_snooze_menu_window(app),
+                "custom-snooze" => hide_custom_snooze_window(app),
+                // O toast só some quando a fila esvazia (invariante do
+                // hide_toast); com alertas pendentes o Alt+F4 é ignorado.
+                "toast" => {
+                    let queue_empty = app
+                        .try_state::<PendingState>()
+                        .and_then(|state| {
+                            lock(&state.0, "alertas pendentes")
+                                .ok()
+                                .map(|q| q.is_empty())
+                        })
+                        .unwrap_or(false);
+                    if queue_empty {
+                        hide_alert_windows(app);
+                    } else {
+                        log(app, "Toast: fechamento ignorado (há alertas pendentes).");
+                    }
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1746,6 +2410,11 @@ pub fn run() {
             get_custom_snooze_target,
             hide_custom_snooze,
             reschedule_notification,
+            take_new_reminder_request,
+            ready_to_quit,
+            copy_secret,
+            get_available_update,
+            get_load_warnings,
             app_version,
             check_for_update,
             install_update,

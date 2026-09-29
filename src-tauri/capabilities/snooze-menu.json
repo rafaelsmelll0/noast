@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "snooze-menu-window",
+  "description": "Permissões do submenu de adiamento",
+  "windows": [
+    "snooze-menu"
+  ],
+  "permissions": [
+    "core:default",
+    "allow-get-settings",
+    "allow-get-snooze-target",
+    "allow-hide-snooze-menu",
+    "allow-open-custom-snooze",
+    "allow-snooze-notification",
+    "allow-snooze-tomorrow"
+  ]
+}

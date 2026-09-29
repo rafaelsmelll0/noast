@@ -429,7 +429,7 @@
               <section class="settings-card">
                 <div class="settings-copy">
                   <h2>Atualizações</h2>
-                  <p>O Noast busca novas versões sozinho e avisa quando encontra.</p>
+                  <p>O Noast procura novas versões e avisa quando encontra. A instalação só acontece quando você clicar em "Atualizar e reiniciar".</p>
                 </div>
                 <div class="settings-controls">
                   <div class="update-row">
@@ -447,6 +447,7 @@
 
               <div class="settings-footer">
                 <span id="settingsStatus" role="status"></span>
+                <button id="settingsRetry" class="button secondary" type="button" hidden>Tentar de novo</button>
                 <button class="button primary" type="submit">Salvar configurações</button>
               </div>
             </form>
@@ -492,6 +493,7 @@
             </label>
           </div>
           <p id="whenHint" class="when-hint" hidden></p>
+          <p id="editHint" class="when-hint edit-hint" role="status" hidden></p>
           <label class="form-field">
             <span>Repetição</span>
             <select id="reminderRepeat">

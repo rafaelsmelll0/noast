@@ -22,41 +22,59 @@ function normalizedError(error, fallback) {
   return error?.message || fallback;
 }
 
-function securePassword(length = 20) {
-  const groups = [
-    "ABCDEFGHJKLMNPQRSTUVWXYZ",
-    "abcdefghijkmnopqrstuvwxyz",
-    "23456789",
-    "!@#$%&*+-_=?.",
-  ];
-  const all = groups.join("");
-  const bytes = new Uint32Array(length);
-  crypto.getRandomValues(bytes);
-  const password = groups.map((group, index) => group[bytes[index] % group.length]);
-  for (let index = groups.length; index < length; index += 1) {
-    password.push(all[bytes[index] % all.length]);
+/// Inteiro uniforme em [0, max). Cada chamada busca bytes novos, e os valores
+/// do topo do intervalo de 32 bits que causariam viés no módulo são
+/// descartados (rejection sampling).
+export function randomIndex(max) {
+  if (!Number.isInteger(max) || max <= 0 || max > 0x100000000) {
+    throw new RangeError("Intervalo inválido para sorteio.");
   }
+  const limit = Math.floor(0x100000000 / max) * max;
+  const buffer = new Uint32Array(1);
+  do {
+    crypto.getRandomValues(buffer);
+  } while (buffer[0] >= limit);
+  return buffer[0] % max;
+}
+
+export const PASSWORD_GROUPS = [
+  "ABCDEFGHJKLMNPQRSTUVWXYZ",
+  "abcdefghijkmnopqrstuvwxyz",
+  "23456789",
+  "!@#$%&*+-_=?.",
+];
+
+export function securePassword(length = 20) {
+  const groups = PASSWORD_GROUPS;
+  const all = groups.join("");
+  // Garante ao menos um caractere de cada grupo; o restante vem do conjunto todo.
+  const password = groups.map((group) => group[randomIndex(group.length)]);
+  for (let index = groups.length; index < length; index += 1) {
+    password.push(all[randomIndex(all.length)]);
+  }
+  // Fisher-Yates com sorteios próprios: reaproveitar os bytes da escolha dos
+  // caracteres deixaria a posição correlacionada com o caractere.
   for (let index = password.length - 1; index > 0; index -= 1) {
-    const target = bytes[index] % (index + 1);
+    const target = randomIndex(index + 1);
     [password[index], password[target]] = [password[target], password[index]];
   }
   return password.join("");
 }
 
-async function writeClipboard(value) {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(value);
-    return;
-  }
-  const fallback = document.createElement("textarea");
-  fallback.value = value;
-  fallback.style.position = "fixed";
-  fallback.style.opacity = "0";
-  document.body.append(fallback);
-  fallback.select();
-  const copied = document.execCommand("copy");
-  fallback.remove();
-  if (!copied) throw new Error("Não foi possível acessar a área de transferência.");
+/// Controlador criado pelo main.js. As funções exportadas abaixo (usadas ao
+/// minimizar/ocultar a janela ou trocar de aba) falam com ele.
+let activeController = null;
+
+/// Há formulário do cofre aberto com alterações ainda não salvas?
+export function vaultFormIsDirty() {
+  return activeController?.formIsDirty() ?? false;
+}
+
+/// Fecha os formulários do cofre, pedindo confirmação se houver alterações.
+/// Resolve true quando não sobrou formulário aberto (pode prosseguir) e false
+/// quando o usuário preferiu continuar editando.
+export function requestCloseVaultForms() {
+  return activeController?.requestCloseForms() ?? Promise.resolve(true);
 }
 
 export function createVaultController({ invoke, showSnackbar, confirmAction }) {
@@ -67,8 +85,25 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     query: "",
     editingClientId: null,
     editingAccessId: null,
-    clipboardVersion: 0,
     revealTimers: new Map(),
+    // Mensagem do backend quando o arquivo do cofre não pôde ser aberto.
+    unavailable: null,
+    // Guarda do "Salvar" do acesso: ligada antes de qualquer await.
+    savingAccess: false,
+    // Promessas dos "Salvar" em andamento (null quando parado). Fechar o
+    // formulário espera por elas: limpá-lo no meio do salvamento gravava um
+    // acesso vazio, e o fim do salvamento fecharia um formulário novo.
+    accessSave: null,
+    clientSave: null,
+    // Conta as aberturas do formulário de acesso. A resposta de uma abertura
+    // anterior (outro card clicado logo em seguida) é descartada.
+    accessOpenToken: 0,
+    // Valores dos formulários no momento em que abriram, para saber se há
+    // alterações a perder.
+    accessSnapshot: null,
+    clientSnapshot: null,
+    // Evita abrir duas confirmações de descarte ao mesmo tempo.
+    confirmingClose: false,
     collapsedGroups: new Set(),
     // null = mostrar todos os acessos do cliente; "" = os que estão fora de
     // qualquer pasta; texto = o nome da pasta escolhida.
@@ -135,15 +170,41 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       .includes(query);
   }
 
+  const clientTextMatches = (client, query) =>
+    `${client.name}\n${client.notes}`.toLocaleLowerCase("pt-BR").includes(query);
+
+  /// O cliente foi encontrado pelo nome/observações dele ou do responsável —
+  /// nesse caso todos os acessos dele interessam, não só os que casam.
+  function clientMatchedByName(client, query) {
+    if (clientTextMatches(client, query)) return true;
+    const parent = client.parent_id
+      ? state.clients.find((item) => item.id === client.parent_id)
+      : null;
+    return Boolean(parent && clientTextMatches(parent, query));
+  }
+
   function filteredClients() {
     if (!state.query) return [...state.clients].sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
     return state.clients
       .filter(
         (client) =>
-          `${client.name}\n${client.notes}`.toLocaleLowerCase("pt-BR").includes(state.query) ||
+          clientTextMatches(client, state.query) ||
           clientAccesses(client.id).some((access) => accessMatches(access, state.query)),
       )
       .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+  }
+
+  /// Ids que aparecem na lista lateral: os encontrados e, sob um responsável
+  /// encontrado, todos os que ele agrupa (ver renderClientList).
+  function listedClientIds() {
+    const clients = filteredClients();
+    const ids = new Set(clients.map((client) => client.id));
+    if (state.query) {
+      for (const client of clients) {
+        childrenOf(client.id).forEach((child) => ids.add(child.id));
+      }
+    }
+    return ids;
   }
 
   const childrenOf = (parentId) =>
@@ -307,6 +368,15 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
 
   function renderFolders(client, accesses) {
     const { named, loose, total } = foldersOf(accesses);
+    // A pasta escolhida pode ter deixado de existir (o último acesso dela foi
+    // movido ou excluído, ou a busca não deixou nenhum nela). Sem esta
+    // revalidação a lista ficaria vazia com o cliente tendo acessos.
+    const folderExists =
+      state.selectedFolder === null ||
+      (state.selectedFolder === ""
+        ? loose > 0
+        : named.some(([name]) => name === state.selectedFolder));
+    if (!folderExists) state.selectedFolder = null;
     // Sem nenhuma pasta criada, a barra não aparece — quem não usa o recurso
     // não ganha uma linha a mais na tela.
     if (named.length === 0) {
@@ -330,9 +400,12 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     if (!client) return;
 
     const allAccesses = clientAccesses(client.id);
-    const searched = state.query
-      ? allAccesses.filter((access) => accessMatches(access, state.query))
-      : allAccesses;
+    // Buscar pelo nome do cliente (ou do responsável) é querer ver o cliente
+    // inteiro; o filtro por acesso só vale quando ele veio pelos acessos.
+    const searched =
+      state.query && !clientMatchedByName(client, state.query)
+        ? allAccesses.filter((access) => accessMatches(access, state.query))
+        : allAccesses;
     renderFolders(client, searched);
     const accesses =
       state.selectedFolder === null
@@ -367,9 +440,86 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
   }
 
   function render() {
+    if (state.unavailable) {
+      renderUnavailable();
+      return;
+    }
     renderClientList();
     renderSelectedClient();
   }
+
+  // Botões que criam ou alteram algo no cofre: ficam desligados enquanto o
+  // arquivo do cofre não puder ser aberto.
+  const writeControls = [
+    "#newVaultClient",
+    "#emptyNewVaultClient",
+    "#editVaultClient",
+    "#deleteVaultClient",
+    "#newVaultAccess",
+    "#emptyNewVaultAccess",
+  ]
+    .map((selector) => document.querySelector(selector))
+    .filter(Boolean);
+  let unavailablePanel = null;
+
+  /// Painel mostrado no lugar do conteúdo quando o backend responde "Cofre
+  /// indisponível". Montado só com textContent: a mensagem vem do sistema.
+  function ensureUnavailablePanel() {
+    if (unavailablePanel) return unavailablePanel;
+    const panel = document.createElement("div");
+    panel.className = "vault-empty-state vault-unavailable";
+    panel.setAttribute("role", "alert");
+    panel.hidden = true;
+    panel.innerHTML = `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="4" y="10" width="16" height="11" rx="2" />
+        <path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3" />
+      </svg>
+      <h2>Cofre indisponível</h2>
+      <p data-unavailable-text>O arquivo do cofre não pôde ser aberto agora. Seus dados foram preservados: nada foi apagado nem sobrescrito. Enquanto isso, não é possível ver, criar ou editar acessos. Feche e abra o Noast novamente; se continuar, confirme que está no mesmo usuário do Windows que criou o cofre.</p>
+      <p data-unavailable-detail class="field-hint"></p>
+      <button class="button secondary" type="button" data-unavailable-retry>Tentar novamente</button>`;
+    panel.querySelector("[data-unavailable-retry]").addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await load();
+        if (state.unavailable) showSnackbar("O cofre continua indisponível.");
+      } finally {
+        button.disabled = false;
+      }
+    });
+    elements.empty.parentElement.prepend(panel);
+    unavailablePanel = panel;
+    return panel;
+  }
+
+  function renderUnavailable() {
+    const panel = ensureUnavailablePanel();
+    const detail = panel.querySelector("[data-unavailable-detail]");
+    detail.textContent = state.unavailable;
+    panel.hidden = false;
+    elements.empty.hidden = true;
+    elements.content.hidden = true;
+    elements.list.innerHTML = "";
+    elements.listEmpty.hidden = true;
+    elements.search.disabled = true;
+    writeControls.forEach((control) => {
+      control.disabled = true;
+    });
+  }
+
+  function leaveUnavailable() {
+    state.unavailable = null;
+    if (unavailablePanel) unavailablePanel.hidden = true;
+    elements.search.disabled = false;
+    writeControls.forEach((control) => {
+      control.disabled = false;
+    });
+  }
+
+  const isUnavailableError = (error) =>
+    normalizedError(error, "").trimStart().startsWith("Cofre indisponível");
 
   function selectClient(id) {
     const changed = id !== state.selectedClientId;
@@ -383,8 +533,96 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
   function closeClientModal() {
     elements.clientModal.hidden = true;
     state.editingClientId = null;
+    state.clientSnapshot = null;
     elements.clientForm.reset();
     elements.clientError.textContent = "";
+  }
+
+  // Tudo o que o usuário pode alterar em cada formulário. Comparar com a foto
+  // tirada na abertura diz se fechar perderia algo.
+  const clientFormValues = () =>
+    JSON.stringify([
+      elements.clientNameInput.value,
+      elements.clientParentInput.value,
+      elements.clientNotesInput.value,
+    ]);
+
+  const accessFormValues = () =>
+    JSON.stringify([
+      elements.accessClient.value,
+      elements.accessNewClientName.hidden,
+      elements.accessNewClientName.value,
+      elements.accessFolder.value,
+      elements.accessLabel.value,
+      elements.accessService.value,
+      elements.accessCustomService.value,
+      elements.accessUrl.value,
+      elements.accessUsername.value,
+      elements.accessRecovery.value,
+      elements.accessPassword.value,
+      elements.accessNotes.value,
+    ]);
+
+  const clientFormIsDirty = () =>
+    !elements.clientModal.hidden &&
+    state.clientSnapshot !== null &&
+    clientFormValues() !== state.clientSnapshot;
+
+  const accessFormIsDirty = () =>
+    !elements.accessModal.hidden &&
+    state.accessSnapshot !== null &&
+    accessFormValues() !== state.accessSnapshot;
+
+  /// Pergunta antes de descartar. Resolve true se pode fechar.
+  async function confirmDiscard(what) {
+    if (state.confirmingClose) return false;
+    state.confirmingClose = true;
+    try {
+      return await confirmAction({
+        dialogTitle: "Descartar alterações?",
+        dialogMessage: `O que foi digitado ${what} ainda não foi salvo e será perdido.`,
+        confirmLabel: "Descartar",
+      });
+    } finally {
+      state.confirmingClose = false;
+    }
+  }
+
+  /// Com um "Salvar" em andamento o formulário não pode ser limpo: espera o
+  /// resultado. Deu certo, o próprio salvamento já fechou o formulário; deu
+  /// errado, ele continua aberto com o erro à vista (resolve false).
+  async function waitPendingSave(pending, modal) {
+    try {
+      await pending;
+    } catch {
+      // O erro já foi mostrado no formulário.
+    }
+    return modal.hidden;
+  }
+
+  async function requestCloseClientModal() {
+    if (elements.clientModal.hidden) return true;
+    if (state.clientSave) return waitPendingSave(state.clientSave, elements.clientModal);
+    if (clientFormIsDirty() && !(await confirmDiscard("neste cliente"))) return false;
+    // O "Salvar" pode ter começado enquanto a pergunta estava aberta.
+    if (state.clientSave) return waitPendingSave(state.clientSave, elements.clientModal);
+    closeClientModal();
+    return true;
+  }
+
+  async function requestCloseAccessModal() {
+    if (elements.accessModal.hidden) return true;
+    if (state.accessSave) return waitPendingSave(state.accessSave, elements.accessModal);
+    if (accessFormIsDirty() && !(await confirmDiscard("neste acesso"))) return false;
+    if (state.accessSave) return waitPendingSave(state.accessSave, elements.accessModal);
+    closeAccessModal();
+    return true;
+  }
+
+  async function requestCloseForms() {
+    // O acesso fica por cima quando os dois estão abertos: fecha-o primeiro.
+    if (!(await requestCloseAccessModal())) return false;
+    return requestCloseClientModal();
   }
 
   /// Monta as opções de responsável. Só clientes principais podem agrupar (a
@@ -406,17 +644,21 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       : "Agrupe quando alguém administra as contas de vários clientes.";
   }
 
-  function openClientModal(client = null) {
+  /// `parentId` só é passado por uma ação explícita de "novo cliente dentro
+  /// deste". O "Novo cliente" comum (cabeçalho, Ctrl+N) nasce sem responsável:
+  /// herdar o cliente aberto o transformava em filho sem o usuário perceber.
+  function openClientModal(client = null, { parentId = "" } = {}) {
+    if (state.unavailable || state.clientSave) return;
     state.editingClientId = client?.id ?? null;
     elements.clientModalTitle.textContent = client ? "Editar cliente" : "Novo cliente";
     elements.clientNameInput.value = client?.name ?? "";
     elements.clientNotesInput.value = client?.notes ?? "";
-    // Criar a partir de um responsável selecionado já vem agrupado nele.
-    const suggestedParent =
-      !client && selectedClient() && !selectedClient().parent_id ? selectedClient().id : "";
     fillParentOptions(client);
-    if (!client && suggestedParent) elements.clientParentInput.value = suggestedParent;
+    const parentAllowed =
+      parentId && [...elements.clientParentInput.options].some((option) => option.value === parentId);
+    if (!client && parentAllowed) elements.clientParentInput.value = parentId;
     elements.clientError.textContent = "";
+    state.clientSnapshot = clientFormValues();
     elements.clientModal.hidden = false;
     window.setTimeout(() => elements.clientNameInput.focus(), 50);
   }
@@ -426,8 +668,9 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     // Cada entrada gera um id novo: sem esta guarda, um clique duplo cadastra
     // o mesmo cliente duas vezes.
     const submitButton = elements.clientForm.querySelector('button[type="submit"]');
-    if (submitButton.disabled) return;
+    if (submitButton.disabled || state.clientSave) return;
 
+    // Tudo é lido do formulário aqui, antes de qualquer await.
     const name = elements.clientNameInput.value.trim();
     if (!name) {
       elements.clientError.textContent = "Informe o nome do cliente.";
@@ -443,6 +686,17 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       updated_at: current?.updated_at ?? "",
     };
     submitButton.disabled = true;
+    const pending = submitClient(client, current);
+    state.clientSave = pending;
+    try {
+      await pending;
+    } finally {
+      state.clientSave = null;
+      submitButton.disabled = false;
+    }
+  }
+
+  async function submitClient(client, current) {
     try {
       const saved = await invoke("save_vault_client", { client });
       const index = state.clients.findIndex((item) => item.id === saved.id);
@@ -453,8 +707,6 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       showSnackbar(current ? "Cliente atualizado." : "Cliente cadastrado.");
     } catch (error) {
       elements.clientError.textContent = normalizedError(error, "Não foi possível salvar o cliente.");
-    } finally {
-      submitButton.disabled = false;
     }
   }
 
@@ -536,8 +788,11 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
   }
 
   function closeAccessModal() {
+    // Uma abertura ainda esperando o backend não deve reabrir o formulário.
+    state.accessOpenToken += 1;
     elements.accessModal.hidden = true;
     state.editingAccessId = null;
+    state.accessSnapshot = null;
     elements.accessForm.reset();
     elements.accessError.textContent = "";
     setPasswordVisibility(false);
@@ -587,7 +842,10 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
 
   async function openAccessModal(accessId = null) {
     const client = selectedClient();
-    if (!client) return;
+    if (!client || state.unavailable || state.accessSave) return;
+    // Dois "Editar" seguidos disparam duas leituras, e a do primeiro card pode
+    // chegar por último: só a abertura mais recente preenche o formulário.
+    const token = ++state.accessOpenToken;
     state.editingAccessId = accessId;
     elements.accessModalTitle.textContent = accessId ? "Editar acesso" : "Novo acesso";
     elements.accessForm.reset();
@@ -602,6 +860,7 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     if (accessId) {
       try {
         const access = await invoke("get_vault_access", { id: accessId });
+        if (token !== state.accessOpenToken) return;
         fillAccessClientOptions(access.client_id);
         elements.accessFolder.value = access.folder ?? "";
         elements.accessLabel.value = access.label;
@@ -612,10 +871,13 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
         elements.accessPassword.value = access.password;
         elements.accessNotes.value = access.notes;
       } catch (error) {
-        showSnackbar(normalizedError(error, "Não foi possível abrir o acesso."));
+        if (token === state.accessOpenToken) {
+          showSnackbar(normalizedError(error, "Não foi possível abrir o acesso."));
+        }
         return;
       }
     }
+    state.accessSnapshot = accessFormValues();
     elements.accessModal.hidden = false;
     window.setTimeout(() => {
       elements.accessLabel.focus();
@@ -626,21 +888,60 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
   async function saveAccess(event) {
     event.preventDefault();
     // Mesma proteção do cliente: sem ela, um clique duplo grava duas cópias da
-    // credencial (com ids diferentes).
+    // credencial (com ids diferentes) — e, com "Novo cliente", dois clientes.
+    // A guarda liga antes do primeiro await; ligá-la depois deixava o segundo
+    // clique passar enquanto o primeiro ainda esperava o backend.
     const submitButton = elements.accessForm.querySelector('button[type="submit"]');
-    if (submitButton.disabled) return;
+    if (state.savingAccess || state.unavailable) return;
+    state.savingAccess = true;
+    submitButton.disabled = true;
+    // A foto do formulário é tirada aqui, de forma síncrona: daqui em diante
+    // só ela é usada. Ler os campos depois de um await gravava o que o
+    // formulário tivesse no momento — vazio, se tivesse sido limpo no meio.
+    const pending = submitAccess(accessFormSnapshot());
+    state.accessSave = pending;
+    try {
+      await pending;
+    } finally {
+      state.accessSave = null;
+      state.savingAccess = false;
+      submitButton.disabled = false;
+    }
+  }
 
-    const client = selectedClient();
+  function accessFormSnapshot() {
+    return {
+      client: selectedClient(),
+      editingAccessId: state.editingAccessId,
+      clientId: elements.accessClient.value,
+      creatingClient: !elements.accessNewClientName.hidden,
+      newClientName: elements.accessNewClientName.value.trim(),
+      folder: elements.accessFolder.value.trim(),
+      label: elements.accessLabel.value.trim(),
+      service: selectedServiceValue(),
+      url: elements.accessUrl.value.trim(),
+      username: elements.accessUsername.value.trim(),
+      password: elements.accessPassword.value,
+      recovery_email: elements.accessRecovery.value.trim(),
+      notes: elements.accessNotes.value.trim(),
+    };
+  }
+
+  async function submitAccess(form) {
+    const { client, label } = form;
     if (!client) return;
-    const label = elements.accessLabel.value.trim();
     if (!label) {
       elements.accessError.textContent = "Informe o nome do acesso.";
       return;
     }
+    if (form.creatingClient && !form.newClientName) {
+      elements.accessError.textContent = "Informe o nome do novo cliente.";
+      return;
+    }
     let current = null;
-    if (state.editingAccessId) {
+    if (form.editingAccessId) {
       try {
-        current = await invoke("get_vault_access", { id: state.editingAccessId });
+        current = await invoke("get_vault_access", { id: form.editingAccessId });
       } catch (error) {
         elements.accessError.textContent = normalizedError(error, "Não foi possível carregar o acesso.");
         return;
@@ -648,15 +949,9 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     }
     // Cliente escolhido no próprio formulário: permite mover um acesso de um
     // cliente para outro sem recriá-lo, e criar o cliente aqui mesmo.
-    let clientId = elements.accessClient.value;
-    const newClientName = elements.accessNewClientName.hidden
-      ? ""
-      : elements.accessNewClientName.value.trim();
-    if (!elements.accessNewClientName.hidden) {
-      if (!newClientName) {
-        elements.accessError.textContent = "Informe o nome do novo cliente.";
-        return;
-      }
+    let clientId = form.clientId;
+    if (form.creatingClient) {
+      const newClientName = form.newClientName;
       try {
         const created = await invoke("save_vault_client", {
           client: {
@@ -670,6 +965,11 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
         });
         state.clients.push(created);
         clientId = created.id;
+        // Daqui em diante o cliente já existe: o formulário passa a apontá-lo
+        // como cliente escolhido. Se salvar o acesso falhar logo abaixo, a
+        // nova tentativa usa este cliente em vez de criar outro igual.
+        fillAccessClientOptions(created.id);
+        renderClientList();
       } catch (error) {
         elements.accessError.textContent = normalizedError(
           error,
@@ -686,18 +986,17 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     const access = {
       id: current?.id ?? crypto.randomUUID(),
       client_id: clientId,
-      folder: elements.accessFolder.value.trim(),
+      folder: form.folder,
       label,
-      service: selectedServiceValue(),
-      url: elements.accessUrl.value.trim(),
-      username: elements.accessUsername.value.trim(),
-      password: elements.accessPassword.value,
-      recovery_email: elements.accessRecovery.value.trim(),
-      notes: elements.accessNotes.value.trim(),
+      service: form.service,
+      url: form.url,
+      username: form.username,
+      password: form.password,
+      recovery_email: form.recovery_email,
+      notes: form.notes,
       created_at: current?.created_at ?? "",
       updated_at: current?.updated_at ?? "",
     };
-    submitButton.disabled = true;
     try {
       const saved = await invoke("save_vault_access", { access });
       const index = state.accesses.findIndex((item) => item.id === saved.id);
@@ -717,8 +1016,6 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
       );
     } catch (error) {
       elements.accessError.textContent = normalizedError(error, "Não foi possível salvar o acesso.");
-    } finally {
-      submitButton.disabled = false;
     }
   }
 
@@ -739,32 +1036,24 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     }
   }
 
-  async function sensitiveClipboard(value, label) {
+  /// Toda cópia de credencial passa pelo backend: ele marca o conteúdo para
+  /// não entrar no histórico do Win+V nem na sincronização na nuvem e o limpa
+  /// após 30 s — só se ainda for o que copiamos, sem apagar o que o usuário
+  /// copiou depois. Feito em JS, a limpeza falhava com a janela sem foco.
+  async function copySecret(value, label) {
     try {
-      await writeClipboard(value);
-      const version = ++state.clipboardVersion;
+      await invoke("copy_secret", { value });
       showSnackbar(`${label} copiad${label === "Senha" ? "a" : "o"}. A área de transferência será limpa em 30 segundos.`);
-      window.setTimeout(async () => {
-        if (version !== state.clipboardVersion) return;
-        let shouldClear = true;
-        try {
-          if (navigator.clipboard?.readText) {
-            const current = await navigator.clipboard.readText();
-            shouldClear = current === value;
-          }
-        } catch {
-          // If reading is denied, prefer clearing a possibly sensitive value.
-        }
-        if (!shouldClear) return;
-        try {
-          await writeClipboard("");
-        } catch {
-          // Clipboard permissions can change after the app loses focus.
-        }
-      }, 30_000);
     } catch (error) {
       showSnackbar(normalizedError(error, "Não foi possível copiar."));
     }
+  }
+
+  /// Texto selecionado dentro de um campo de texto, ou "" se não houver.
+  function selectedFieldText(input) {
+    const { selectionStart: start, selectionEnd: end } = input;
+    if (start === null || end === null || end <= start) return "";
+    return input.value.slice(start, end);
   }
 
   async function fullAccess(id) {
@@ -805,11 +1094,24 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
   async function load() {
     try {
       const catalog = await invoke("get_vault_catalog");
+      if (state.unavailable) leaveUnavailable();
       state.clients = catalog.clients;
       state.accesses = catalog.accesses;
       state.selectedClientId = [...state.clients].sort((a, b) => a.name.localeCompare(b.name, "pt-BR"))[0]?.id ?? null;
+      state.selectedFolder = null;
       render();
     } catch (error) {
+      if (isUnavailableError(error)) {
+        // Só o cofre fica fora do ar; o resto do app segue funcionando.
+        state.unavailable = normalizedError(error, "Cofre indisponível.");
+        state.clients = [];
+        state.accesses = [];
+        state.selectedClientId = null;
+        closeAccessModal();
+        closeClientModal();
+        render();
+        return;
+      }
       showSnackbar(normalizedError(error, "Não foi possível abrir o cofre."));
     }
   }
@@ -839,27 +1141,28 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
   elements.clientForm.addEventListener("submit", saveClient);
   elements.accessForm.addEventListener("submit", saveAccess);
 
+  // Cancelar, o X e o clique fora pedem confirmação se houver algo digitado.
   document.querySelectorAll("[data-close-vault-client]").forEach((button) => {
-    button.addEventListener("click", closeClientModal);
+    button.addEventListener("click", () => requestCloseClientModal());
   });
   document.querySelectorAll("[data-close-vault-access]").forEach((button) => {
-    button.addEventListener("click", closeAccessModal);
+    button.addEventListener("click", () => requestCloseAccessModal());
   });
 
   elements.clientModal.addEventListener("click", (event) => {
-    if (event.target === elements.clientModal) closeClientModal();
+    if (event.target === elements.clientModal) requestCloseClientModal();
   });
   elements.accessModal.addEventListener("click", (event) => {
-    if (event.target === elements.accessModal) closeAccessModal();
+    if (event.target === elements.accessModal) requestCloseAccessModal();
   });
 
   elements.search.addEventListener("input", (event) => {
     state.query = event.target.value.trim().toLocaleLowerCase("pt-BR");
-    const visible = filteredClients();
-    if (!visible.some((client) => client.id === state.selectedClientId)) {
-      state.selectedClientId = visible[0]?.id ?? null;
-    }
-    render();
+    const listed = listedClientIds();
+    const keep = listed.has(state.selectedClientId);
+    // selectClient zera o filtro de pasta quando o cliente muda; trocar o id
+    // direto herdava a pasta do cliente anterior.
+    selectClient(keep ? state.selectedClientId : (filteredClients()[0]?.id ?? null));
   });
 
   // Cria o cliente sem sair do cadastro do acesso: o campo de nome aparece no
@@ -908,11 +1211,11 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
         showSnackbar(normalizedError(error, "Não foi possível abrir o site."));
       }
     }
-    if (action === "copy-user") await sensitiveClipboard(access.username, "Usuário");
+    if (action === "copy-user") await copySecret(access.username, "Usuário");
     if (action === "copy-password") {
       try {
         const complete = await fullAccess(access.id);
-        await sensitiveClipboard(complete.password, "Senha");
+        await copySecret(complete.password, "Senha");
       } catch (error) {
         showSnackbar(normalizedError(error, "Não foi possível copiar a senha."));
       }
@@ -941,6 +1244,38 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
     setPasswordVisibility(true);
     elements.accessPassword.focus();
     elements.accessPassword.select();
+  });
+
+  // Ctrl+C (ou recortar) no campo de senha também vai pelo copy_secret: pela
+  // área de transferência comum a senha gerada ficaria no histórico do Win+V
+  // e nunca seria limpa.
+  elements.accessPassword.addEventListener("copy", (event) => {
+    const selected = selectedFieldText(elements.accessPassword);
+    if (!selected) return;
+    event.preventDefault();
+    copySecret(selected, "Senha");
+  });
+  elements.accessPassword.addEventListener("cut", (event) => {
+    const input = elements.accessPassword;
+    const selected = selectedFieldText(input);
+    if (!selected) return;
+    event.preventDefault();
+    copySecret(selected, "Senha");
+    input.setRangeText("", input.selectionStart, input.selectionEnd, "end");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+
+  // O mesmo para a senha revelada num card, se o usuário a selecionar e copiar.
+  elements.accessList.addEventListener("copy", (event) => {
+    const selection = document.getSelection();
+    const text = selection?.toString() ?? "";
+    if (!text || !selection.rangeCount) return;
+    const node = selection.getRangeAt(0).commonAncestorContainer;
+    const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    const revealed = element?.closest("[data-password-value]");
+    if (!revealed || revealed.classList.contains("vault-password-mask")) return;
+    event.preventDefault();
+    copySecret(text, "Senha");
   });
 
   elements.accessScroll.addEventListener("scroll", updateAccessScrollbar);
@@ -992,25 +1327,49 @@ export function createVaultController({ invoke, showSnackbar, confirmAction }) {
   window.addEventListener("resize", updateAccessScrollbar);
 
   document.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape") return;
-    if (!elements.accessModal.hidden) closeAccessModal();
-    else if (!elements.clientModal.hidden) closeClientModal();
+    // O Esc que fecha o diálogo de confirmação chega aqui já tratado; sem esta
+    // checagem ele reabriria a pergunta.
+    if (event.key !== "Escape" || event.defaultPrevented || state.confirmingClose) return;
+    if (!elements.accessModal.hidden) requestCloseAccessModal();
+    else if (!elements.clientModal.hidden) requestCloseClientModal();
   });
 
-  return {
+  const controller = {
     load,
     activate() {
+      if (state.unavailable) return;
       if (!selectedClient() && state.clients.length) {
         selectClient(filteredClients()[0]?.id ?? null);
       }
     },
     createClient() {
+      if (state.unavailable) {
+        showSnackbar("O cofre está indisponível no momento.");
+        return;
+      }
+      // Ctrl+N com um formulário aberto não empilha outro por baixo dele.
+      if (!elements.accessModal.hidden || !elements.clientModal.hidden) return;
       openClientModal();
     },
+    /// Há formulário do cofre aberto com alterações não salvas?
+    formIsDirty() {
+      return accessFormIsDirty() || clientFormIsDirty();
+    },
+    /// Fecha os formulários, confirmando o descarte se preciso. Resolve true
+    /// quando nenhum ficou aberto.
+    requestCloseForms,
+    /// Esconde as senhas reveladas e fecha os formulários sem alterações.
+    /// Formulário com alterações nunca é descartado aqui: fica aberto (com a
+    /// senha mascarada) para o usuário decidir ao voltar. Para fechar
+    /// perguntando, use requestCloseForms antes.
     deactivate() {
       hideRevealedPasswords();
-      closeAccessModal();
-      closeClientModal();
+      // Formulário salvando também fica: o fim do salvamento o fecha.
+      if (accessFormIsDirty() || state.accessSave) setPasswordVisibility(false);
+      else closeAccessModal();
+      if (!clientFormIsDirty() && !state.clientSave) closeClientModal();
     },
   };
+  activeController = controller;
+  return controller;
 }

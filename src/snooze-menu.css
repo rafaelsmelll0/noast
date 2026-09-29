@@ -5,6 +5,7 @@
   --ink: #181814;
   --body: #46463f;
   --line: #dfdfd8;
+  --danger: #c93d35;
   font-family: Inter, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
 }
 
@@ -15,6 +16,7 @@
   --ink: #f5f5ef;
   --body: #cdcdc4;
   --line: #45453d;
+  --danger: #f1766e;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -25,6 +27,7 @@
     --ink: #f5f5ef;
     --body: #cdcdc4;
     --line: #45453d;
+    --danger: #f1766e;
   }
 }
 
@@ -48,6 +51,7 @@ body {
 }
 
 .menu {
+  position: relative;
   display: grid;
   gap: 2px;
   padding: 5px;
@@ -74,4 +78,27 @@ button:focus-visible {
   background: var(--surface-soft);
   color: var(--ink);
   outline: 0;
+}
+
+/* Erro ao adiar: cobre as opções por um instante antes de o menu fechar
+   (a janela é pequena demais para uma linha extra). */
+.menu-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 12px;
+  background: var(--surface);
+  border-radius: 10px;
+  color: var(--danger, #c93d35);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-align: center;
+}
+
+.menu-error[hidden] {
+  display: none;
 }

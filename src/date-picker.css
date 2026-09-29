@@ -40,11 +40,16 @@
   color: var(--muted);
 }
 
+/* fixed (com top/left calculados em date-picker.js) para não ser cortado pelo
+   overflow do modal nem pela borda da janela Personalizar. */
 .date-popover {
-  position: absolute;
+  position: fixed;
   z-index: 40;
+  top: 0;
+  left: 0;
   width: 268px;
-  margin-top: 6px;
+  max-width: calc(100vw - 16px);
+  margin: 0;
   padding: 12px;
   background: var(--surface);
   border: 1px solid var(--line);

@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { formatBr, isoDate, monthGrid, parseIso } from "../src/date-picker.js";
+import {
+  formatBr,
+  isoDate,
+  monthGrid,
+  parseIso,
+  popoverPlacement,
+} from "../src/date-picker.js";
 
 test("isoDate usa o fuso local, sem deslocar o dia", () => {
   assert.equal(isoDate(new Date(2026, 7, 14, 23, 30)), "2026-08-14");
@@ -48,4 +54,39 @@ test("monthGrid inclui o primeiro e o último dia do mês", () => {
 test("monthGrid cobre 29 de fevereiro em ano bissexto", () => {
   assert.ok(monthGrid(2024, 1).map(isoDate).includes("2024-02-29"));
   assert.ok(!monthGrid(2026, 1).map(isoDate).includes("2026-02-29"));
+});
+
+const viewport = { width: 800, height: 600 };
+const size = { width: 268, height: 300 };
+
+test("popoverPlacement abre embaixo do campo quando cabe", () => {
+  const anchor = { top: 100, bottom: 140, left: 50 };
+  const placement = popoverPlacement(anchor, size, viewport);
+  assert.equal(placement.above, false);
+  assert.equal(placement.top, 146);
+  assert.equal(placement.left, 50);
+});
+
+// O caso do bug: campo perto do rodapé do modal, calendário cortado.
+test("popoverPlacement abre para cima quando não cabe embaixo", () => {
+  const anchor = { top: 450, bottom: 490, left: 50 };
+  const placement = popoverPlacement(anchor, size, viewport);
+  assert.equal(placement.above, true);
+  assert.equal(placement.top, 450 - 6 - 300);
+  assert.ok(placement.top + size.height <= viewport.height);
+});
+
+test("popoverPlacement nunca sai da janela", () => {
+  // Nem embaixo nem em cima cabe inteiro: fica preso dentro da janela.
+  const tight = { width: 300, height: 360 };
+  const placement = popoverPlacement({ top: 150, bottom: 180, left: 200 }, size, tight);
+  assert.ok(placement.top >= 8);
+  assert.ok(placement.top + size.height <= tight.height - 8 || placement.top === 8);
+  assert.ok(placement.left >= 8);
+  assert.ok(placement.left + size.width <= tight.width - 8 || placement.left === 8);
+});
+
+test("popoverPlacement encosta à esquerda quando o campo está perto da borda direita", () => {
+  const placement = popoverPlacement({ top: 100, bottom: 140, left: 700 }, size, viewport);
+  assert.equal(placement.left, viewport.width - size.width - 8);
 });

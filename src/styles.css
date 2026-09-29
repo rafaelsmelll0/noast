@@ -964,7 +964,11 @@ h1 {
   line-height: 1.65;
   outline: 0;
   user-select: text;
-  white-space: normal;
+  /* Espaços repetidos e recuos aparecem como estão gravados (e o navegador
+     não os descarta ao editar ao lado). O Shift+Enter passa a inserir "\n"
+     no texto, que o serializador trata como quebra de linha. */
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
 }
 
 .note-preview[hidden] {
@@ -1991,7 +1995,8 @@ h1 {
 .modal {
   width: min(450px, 100%);
   /* Em janelas baixas o conteúdo rola dentro do modal, em vez de empurrar os
-     botões de ação para fora da tela. */
+     botões de ação para fora da tela. O calendário (.date-popover) é fixed e
+     posicionado por date-picker.js, então esta rolagem não o corta. */
   max-height: 100%;
   overflow-y: auto;
   padding: 25px;
@@ -2367,6 +2372,14 @@ h1 {
 
 .when-hint.is-past {
   color: var(--danger);
+}
+
+/* Dica do modo edição (lembrete adiado, alterado por fora): discreta, como o
+   resumo de horário, mas com um traço de destaque para não se confundir. */
+.edit-hint {
+  padding-left: 8px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  line-height: 1.45;
 }
 
 @media (prefers-reduced-motion: reduce) {

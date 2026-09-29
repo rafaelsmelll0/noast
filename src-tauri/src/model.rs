@@ -210,6 +210,11 @@ pub struct Notification {
     /// concluído. Vazio quando `datetime` já é o horário da série.
     #[serde(default)]
     pub series_datetime: String,
+    /// Dia do mês que a série mensal/anual pretende. "Todo dia 31" cai em
+    /// 28/02, mas deve voltar ao 31 em março; sem guardar o dia, o 28 virava a
+    /// nova âncora para sempre. 0 = usar o dia de `datetime`.
+    #[serde(default)]
+    pub series_day: u32,
 }
 
 impl Notification {

@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "custom-snooze-window",
+  "description": "Permissões da janela de adiamento personalizado",
+  "windows": [
+    "custom-snooze"
+  ],
+  "permissions": [
+    "core:default",
+    "allow-get-custom-snooze-target",
+    "allow-get-settings",
+    "allow-hide-custom-snooze",
+    "allow-reschedule-notification"
+  ]
+}

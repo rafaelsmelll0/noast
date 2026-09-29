@@ -39,11 +39,20 @@ export function createConfirmDialog() {
   overlay.addEventListener("click", (event) => {
     if (event.target === overlay) finish(false);
   });
-  overlay.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
+  // Esc cancela com o diálogo aberto mesmo que o foco ainda não tenha
+  // entrado nele (ele só recebe o foco 30 ms depois de abrir). Na captura e
+  // interrompido: o Esc não pode também fechar o formulário por trás.
+  window.addEventListener(
+    "keydown",
+    (event) => {
+      if (event.key !== "Escape" || overlay.hidden) return;
       event.preventDefault();
+      event.stopImmediatePropagation();
       finish(false);
-    }
+    },
+    true,
+  );
+  overlay.addEventListener("keydown", (event) => {
     if (event.key !== "Tab") return;
     if (!event.shiftKey && document.activeElement === confirm) {
       event.preventDefault();

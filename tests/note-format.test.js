@@ -11,7 +11,8 @@ test("inlineWhatsapp converte negrito, itálico, tachado e mono", () => {
   assert.equal(inlineWhatsapp("*a*"), "<strong>a</strong>");
   assert.equal(inlineWhatsapp("_a_"), "<em>a</em>");
   assert.equal(inlineWhatsapp("~a~"), "<s>a</s>");
-  assert.equal(inlineWhatsapp("`a`"), "<code>a</code>");
+  assert.equal(inlineWhatsapp("`a`"), '<code data-tick="">a</code>');
+  assert.equal(inlineWhatsapp("```a```"), "<code>a</code>");
 });
 
 test("previewHtml: vazio vira string vazia", () => {
@@ -38,7 +39,7 @@ test("previewHtml: parágrafo escapa HTML (sem XSS)", () => {
 
 test("previewHtml: citação e bloco de código", () => {
   assert.equal(previewHtml("> nota"), "<blockquote>nota</blockquote>");
-  assert.equal(previewHtml("```\ncode\n```"), "<pre><code>\ncode\n</code></pre>");
+  assert.equal(previewHtml("```\ncode\n```"), "<pre><code><br>code<br><br></code></pre>");
 });
 
 test("previewHtml: duas listas de tipos diferentes não se fundem", () => {

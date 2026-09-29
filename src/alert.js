@@ -9,6 +9,9 @@ const state = {
     snooze_minutes: 15,
   },
   presenting: false,
+  // Pedido de apresentação que chegou com outro present_toast em andamento
+  // (null = nenhum; senão, se era forçado). Refeito ao fim do atual.
+  pendingPresent: null,
   lastHeight: 0,
   presentationVersion: 0,
   snoozeMenuOpen: false,
@@ -156,10 +159,28 @@ async function refreshQueue(animate = false) {
   }
 }
 
-async function present() {
-  if (state.queue.length === 0 || state.presenting) return;
+/// Altura do card SEM o transform da animação de entrada (scale 0.985):
+/// getBoundingClientRect media o card encolhido e a janela ficava 2–4 px
+/// mais baixa, cortando a borda de baixo.
+function cardHeight() {
+  // offsetHeight arredonda para inteiro e perde até 1 px; o retângulo real
+  // dividido pela escala atual dá a altura exata sem a animação.
+  const rect = elements.card.getBoundingClientRect();
+  const scale = new DOMMatrixReadOnly(getComputedStyle(elements.card).transform).d || 1;
+  return Math.ceil(rect.height / scale + 2);
+}
+
+async function present(force = false) {
+  if (state.queue.length === 0) return;
+  if (state.presenting) {
+    // Antes este pedido era descartado: se o card cresceu enquanto o anterior
+    // estava em andamento, a janela ficava com a altura antiga e o card
+    // cortado. Guarda-o para refazer quando o atual terminar.
+    state.pendingPresent = Boolean(state.pendingPresent) || force;
+    return;
+  }
   const version = state.presentationVersion;
-  const height = Math.ceil(elements.card.getBoundingClientRect().height + 2);
+  const height = cardHeight();
   if (height < 50) return;
   state.presenting = true;
   try {
@@ -174,6 +195,13 @@ async function present() {
     showError(errorMessage(error));
   } finally {
     state.presenting = false;
+    if (state.pendingPresent !== null) {
+      const pendingForce = state.pendingPresent;
+      state.pendingPresent = null;
+      // schedulePresent (setTimeout) remede o card: sem forçar, só reapresenta
+      // se a altura ainda difere da que acabou de ser aplicada.
+      schedulePresent(pendingForce);
+    }
   }
 }
 
@@ -184,8 +212,8 @@ function schedulePresent(force = false) {
   // para sempre. Timers continuam rodando nesses estados.
   window.setTimeout(() => {
     if (version !== state.presentationVersion || state.queue.length === 0) return;
-    const height = Math.ceil(elements.card.getBoundingClientRect().height + 2);
-    if (force || Math.abs(height - state.lastHeight) > 1) present();
+    const height = cardHeight();
+    if (force || Math.abs(height - state.lastHeight) > 1) present(force);
   }, 30);
 }
 
@@ -205,7 +233,14 @@ async function actOnItem(item, action, minutes = null) {
     await refreshQueue();
   } catch (error) {
     item.classList.remove("busy", "leaving");
-    showError(errorMessage(error));
+    const message = errorMessage(error);
+    // O item saiu da fila por outro caminho (outra janela, disparo de série):
+    // não é erro do usuário — basta redesenhar a fila atual.
+    if (message.includes("não está mais pendente")) {
+      await refreshQueue();
+      return;
+    }
+    showError(message);
   }
 }
 
@@ -230,7 +265,15 @@ elements.list.addEventListener("click", (event) => {
       .then((opened) => {
         state.snoozeMenuOpen = opened;
       })
-      .catch((error) => showError(errorMessage(error)));
+      .catch((error) => {
+        const message = errorMessage(error);
+        // O lembrete saiu da fila por outro caminho: só redesenha.
+        if (message.includes("não está mais pendente")) {
+          refreshQueue();
+          return;
+        }
+        showError(message);
+      });
     return;
   }
 

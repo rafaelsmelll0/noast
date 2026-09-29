@@ -29,17 +29,27 @@ pub fn advance_after(notification: &mut Notification, now: NaiveDateTime) -> Res
     // adiamento: concluir um "toda terça 9h" adiado para quinta mantém a
     // série na terça. O laço avança quantas ocorrências forem necessárias,
     // então adiar além da próxima terça também cai na terça seguinte.
-    let mut datetime = notification.series_anchor()?;
+    let anchor = notification.series_anchor()?;
+    let day = if notification.series_day > 0 {
+        notification.series_day
+    } else {
+        anchor.day()
+    };
+    let mut datetime = skip_whole_periods(anchor, notification.repeat, now);
     let mut guard = 0;
     while datetime <= now {
-        datetime = next_occurrence(datetime, notification.repeat);
+        datetime = next_occurrence_on_day(datetime, notification.repeat, day);
         guard += 1;
-        if guard > 10_000 {
+        if guard > 100_000 {
             return Err("Não foi possível calcular a próxima ocorrência.".to_string());
         }
     }
 
     notification.datetime = datetime.format("%Y-%m-%dT%H:%M:%S").to_string();
+    notification.series_day = match notification.repeat {
+        Repeat::Monthly | Repeat::Yearly => day,
+        _ => 0,
+    };
     notification.series_datetime.clear();
     notification.done = false;
     notification.last_fired.clear();
@@ -48,7 +58,12 @@ pub fn advance_after(notification: &mut Notification, now: NaiveDateTime) -> Res
 
 pub fn snooze(notification: &mut Notification, minutes: u32, now: NaiveDateTime) {
     notification.remember_series_anchor();
-    notification.datetime = (now + Duration::minutes(i64::from(minutes)))
+    // Minuto cheio: o formulário edita só HH:MM, e segundos no horário faziam
+    // uma edição de texto parecer troca de data (e soltar a série).
+    let target = now + Duration::minutes(i64::from(minutes));
+    notification.datetime = target
+        .with_second(0)
+        .unwrap_or(target)
         .format("%Y-%m-%dT%H:%M:%S")
         .to_string();
     notification.done = false;
@@ -59,7 +74,9 @@ pub fn snooze_until_tomorrow(
     notification: &mut Notification,
     now: NaiveDateTime,
 ) -> Result<(), String> {
-    let original = notification.parsed_datetime()?;
+    // Horário da série, não o do adiamento: "toda terça 9h" adiado para 9h15 e
+    // depois para amanhã deve tocar amanhã às 9h.
+    let original = notification.series_anchor()?;
     notification.remember_series_anchor();
     let tomorrow = now.date() + Duration::days(1);
     notification.datetime = tomorrow
@@ -88,30 +105,48 @@ pub fn reschedule_to(
     Ok(())
 }
 
-pub fn next_occurrence(datetime: NaiveDateTime, repeat: Repeat) -> NaiveDateTime {
+#[cfg(test)]
+fn next_occurrence(datetime: NaiveDateTime, repeat: Repeat) -> NaiveDateTime {
+    next_occurrence_on_day(datetime, repeat, datetime.day())
+}
+
+/// Próxima ocorrência mirando `day` nas séries mensais/anuais (limitado ao
+/// último dia do mês); as de período fixo ignoram o dia.
+fn next_occurrence_on_day(datetime: NaiveDateTime, repeat: Repeat, day: u32) -> NaiveDateTime {
     match repeat {
         Repeat::Daily => datetime + Duration::days(1),
         Repeat::Weekly => datetime + Duration::weeks(1),
         Repeat::Biweekly => datetime + Duration::weeks(2),
-        Repeat::Monthly => add_months_clamped(datetime, 1),
-        Repeat::Yearly => add_years_clamped(datetime, 1),
+        Repeat::Monthly => {
+            let zero_based = datetime.month0() + 1;
+            let year = datetime.year() + (zero_based / 12) as i32;
+            build_clamped(datetime, year, zero_based % 12 + 1, day)
+        }
+        Repeat::Yearly => build_clamped(datetime, datetime.year() + 1, datetime.month(), day),
         Repeat::None => datetime,
     }
 }
 
-fn add_months_clamped(datetime: NaiveDateTime, months: u32) -> NaiveDateTime {
-    let zero_based = datetime.month0() + months;
-    let year = datetime.year() + (zero_based / 12) as i32;
-    let month = (zero_based % 12) + 1;
-    build_clamped(datetime, year, month)
+/// Pula de uma vez os períodos inteiros já vencidos das séries de período
+/// fixo: uma âncora com o ano digitado errado (décadas atrás) não pode
+/// esgotar o laço de `advance_after` e travar a conclusão.
+fn skip_whole_periods(anchor: NaiveDateTime, repeat: Repeat, now: NaiveDateTime) -> NaiveDateTime {
+    let period = match repeat {
+        Repeat::Daily => Duration::days(1),
+        Repeat::Weekly => Duration::weeks(1),
+        Repeat::Biweekly => Duration::weeks(2),
+        _ => return anchor,
+    };
+    if anchor > now {
+        return anchor;
+    }
+    let behind = (now - anchor).num_seconds() / period.num_seconds();
+    let skip = i32::try_from(behind.saturating_sub(1)).unwrap_or(i32::MAX);
+    anchor.checked_add_signed(period * skip).unwrap_or(anchor)
 }
 
-fn add_years_clamped(datetime: NaiveDateTime, years: i32) -> NaiveDateTime {
-    build_clamped(datetime, datetime.year() + years, datetime.month())
-}
-
-fn build_clamped(source: NaiveDateTime, year: i32, month: u32) -> NaiveDateTime {
-    let day = source.day().min(days_in_month(year, month));
+fn build_clamped(source: NaiveDateTime, year: i32, month: u32, day: u32) -> NaiveDateTime {
+    let day = day.clamp(1, days_in_month(year, month));
     NaiveDate::from_ymd_opt(year, month, day)
         .expect("valid clamped date")
         .and_hms_opt(source.hour(), source.minute(), source.second())
@@ -166,6 +201,7 @@ mod tests {
             done: false,
             last_fired: "2026-01-10T10:00".into(),
             series_datetime: String::new(),
+            series_day: 0,
         };
         let now = at("2026-01-10T10:01:00");
         assert!(!is_due(&notification, now, false));
@@ -182,6 +218,7 @@ mod tests {
             done: false,
             last_fired: "2026-01-01T10:00".into(),
             series_datetime: String::new(),
+            series_day: 0,
         };
         advance_after(&mut notification, at("2026-01-03T12:00:00")).expect("advance");
         assert_eq!(notification.datetime, "2026-01-04T10:00:00");
@@ -198,6 +235,7 @@ mod tests {
             done: false,
             last_fired: "2026-06-13T08:45".into(),
             series_datetime: String::new(),
+            series_day: 0,
         };
         snooze_until_tomorrow(&mut notification, at("2026-06-13T22:10:00"))
             .expect("snooze tomorrow");
@@ -215,6 +253,7 @@ mod tests {
             done: false,
             last_fired: "2026-06-13T08:45".into(),
             series_datetime: String::new(),
+            series_day: 0,
         };
         let now = at("2026-06-13T22:10:00");
         assert!(reschedule_to(&mut notification, at("2026-06-13T20:00:00"), now).is_err());
@@ -239,6 +278,7 @@ mod tests {
             done: false,
             last_fired: String::new(),
             series_datetime: String::new(),
+            series_day: 0,
         }
     }
 
@@ -479,15 +519,75 @@ mod tests {
             Duration::hours(6),
             |_| Act::Complete,
         );
-        // Fevereiro/2026 tem 28 dias: a partir daí a série fixa no dia 28.
+        // Fevereiro/2026 tem 28 dias, mas a série continua sendo "dia 31":
+        // março volta ao 31 e abril (30 dias) cai no último dia.
         assert_eq!(
             keys(&fired),
             [
                 "2026-01-31T09:00",
                 "2026-02-28T09:00",
-                "2026-03-28T09:00",
-                "2026-04-28T09:00",
+                "2026-03-31T09:00",
+                "2026-04-30T09:00",
             ]
         );
+    }
+
+    #[test]
+    fn monthly_catch_up_after_pc_off_keeps_the_intended_day() {
+        let mut monthly = note("mensal", "2026-01-31T09:00:00", Repeat::Monthly);
+        // PC desligado de 31/01 a 01/04: concluir pula para a próxima ocorrência.
+        advance_after(&mut monthly, at("2026-04-01T10:00:00")).expect("advance");
+        assert_eq!(monthly.datetime, "2026-04-30T09:00:00");
+        advance_after(&mut monthly, at("2026-04-30T09:05:00")).expect("advance");
+        assert_eq!(monthly.datetime, "2026-05-31T09:00:00");
+    }
+
+    #[test]
+    fn yearly_leap_day_returns_on_leap_years() {
+        let mut yearly = note("bissexto", "2024-02-29T08:00:00", Repeat::Yearly);
+        let mut seen = Vec::new();
+        for year in 2024..2028 {
+            let now = at(&format!("{year}-03-01T00:00:00"));
+            advance_after(&mut yearly, now).expect("advance");
+            seen.push(yearly.datetime.clone());
+        }
+        assert_eq!(
+            seen,
+            [
+                "2025-02-28T08:00:00",
+                "2026-02-28T08:00:00",
+                "2027-02-28T08:00:00",
+                "2028-02-29T08:00:00",
+            ]
+        );
+    }
+
+    #[test]
+    fn very_old_anchor_still_completes() {
+        let mut daily = note("ano-errado", "1990-01-01T07:00:00", Repeat::Daily);
+        advance_after(&mut daily, at("2026-09-29T12:00:00")).expect("advance");
+        assert_eq!(daily.datetime, "2026-09-30T07:00:00");
+
+        let mut biweekly = note("quinzenal", "2000-01-03T07:00:00", Repeat::Biweekly);
+        advance_after(&mut biweekly, at("2026-09-29T12:00:00")).expect("advance");
+        let next = biweekly.parsed_datetime().expect("datetime");
+        assert!(next > at("2026-09-29T12:00:00"));
+        assert!(next <= at("2026-10-13T12:00:00"));
+        assert_eq!((next - at("2000-01-03T07:00:00")).num_days() % 14, 0);
+    }
+
+    #[test]
+    fn snooze_lands_on_a_whole_minute() {
+        let mut once = note("pontual", "2026-07-07T09:00:00", Repeat::None);
+        snooze(&mut once, 15, at("2026-07-07T09:00:37"));
+        assert_eq!(once.datetime, "2026-07-07T09:15:00");
+    }
+
+    #[test]
+    fn tomorrow_after_a_snooze_uses_the_series_time() {
+        let mut weekly = note("semanal", "2026-07-07T09:00:00", Repeat::Weekly);
+        snooze(&mut weekly, 15, at("2026-07-07T09:00:10"));
+        snooze_until_tomorrow(&mut weekly, at("2026-07-07T09:20:00")).expect("tomorrow");
+        assert_eq!(weekly.datetime, "2026-07-08T09:00:00");
     }
 }
