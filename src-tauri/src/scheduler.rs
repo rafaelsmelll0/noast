@@ -105,6 +105,49 @@ pub fn reschedule_to(
     Ok(())
 }
 
+/// Mesmo horário para o formulário, que só edita até o minuto: lembretes
+/// adiados por versões antigas guardavam segundos.
+fn same_minute(left: &str, right: &str) -> bool {
+    left.get(..16)
+        .is_some_and(|prefix| Some(prefix) == right.get(..16))
+}
+
+/// Lembrete novo vindo do formulário: nada do que o agendador sabe vale.
+pub fn prepare_new(mut notification: Notification) -> Notification {
+    notification.done = false;
+    notification.last_fired.clear();
+    notification.series_datetime.clear();
+    notification.series_day = 0;
+    notification
+}
+
+/// Aplica a edição do formulário sobre o lembrete salvo. Devolve `true` quando
+/// só o texto mudou (mesmo horário, mesma repetição): aí o lembrete mantém tudo
+/// que o agendador sabe dele — disparo, horário oficial da série (um
+/// recorrente adiado continua voltando ao horário original) e dia da série.
+/// O formulário não conhece esses campos, então nunca os sobrescreve.
+pub fn apply_edit(existing: &mut Notification, mut incoming: Notification) -> bool {
+    let kept =
+        same_minute(&existing.datetime, &incoming.datetime) && existing.repeat == incoming.repeat;
+    if kept {
+        existing.text = incoming.text;
+        return true;
+    }
+    // Data ou repetição novas: a âncora antiga da série não vale mais. Só a
+    // hora mudou (mesmo dia, mesma repetição): o dia pretendido da série
+    // mensal continua valendo — um "todo dia 31" parado em 28/02 não pode
+    // virar "dia 28".
+    let same_day = existing.datetime.get(..10).is_some()
+        && existing.datetime.get(..10) == incoming.datetime.get(..10)
+        && existing.repeat == incoming.repeat;
+    incoming.series_day = if same_day { existing.series_day } else { 0 };
+    incoming.done = false;
+    incoming.last_fired.clear();
+    incoming.series_datetime.clear();
+    *existing = incoming;
+    false
+}
+
 #[cfg(test)]
 fn next_occurrence(datetime: NaiveDateTime, repeat: Repeat) -> NaiveDateTime {
     next_occurrence_on_day(datetime, repeat, datetime.day())
@@ -589,5 +632,87 @@ mod tests {
         snooze(&mut weekly, 15, at("2026-07-07T09:00:10"));
         snooze_until_tomorrow(&mut weekly, at("2026-07-07T09:20:00")).expect("tomorrow");
         assert_eq!(weekly.datetime, "2026-07-08T09:00:00");
+    }
+
+    /// O relato do usuário: "toda quarta 8h", adiado ~10 vezes pelo toast e
+    /// concluído às 15h. A próxima tem de ser na quarta seguinte às 8h — não
+    /// às 15h. Cobre também os outros jeitos de adiar, reiniciar o app no meio
+    /// (o arquivo é regravado e relido) e editar só o texto enquanto adiado.
+    #[test]
+    fn weekly_snoozed_all_day_and_completed_late_returns_to_its_slot() {
+        let fire = at("2026-09-30T08:00:00");
+        let form_edit = |current: &Notification, text: &str| Notification {
+            // O que o formulário manda: sem campos do agendador, hora sem segundos.
+            text: text.into(),
+            datetime: format!("{}:00", &current.datetime[..16]),
+            last_fired: String::new(),
+            series_datetime: String::new(),
+            series_day: 0,
+            ..current.clone()
+        };
+
+        let mut weekly = note("cinema", "2026-09-30T08:00:00", Repeat::Weekly);
+        weekly.last_fired = occurrence_key(&fire);
+        let mut clock = fire;
+        for round in 0..10 {
+            clock += Duration::minutes(40) + Duration::seconds(17);
+            match round % 4 {
+                0 => snooze(&mut weekly, 15, clock),
+                1 => snooze(&mut weekly, 60, clock),
+                2 => reschedule_to(&mut weekly, clock + Duration::minutes(20), clock)
+                    .expect("personalizar"),
+                _ => {
+                    // Reinicia o app: grava e relê o arquivo.
+                    let json = serde_json::to_string(&weekly).expect("save");
+                    weekly = serde_json::from_str(&json).expect("load");
+                    snooze(&mut weekly, 30, clock);
+                }
+            }
+            if round == 5 {
+                // Corrige o texto na janela principal enquanto está adiado.
+                let edit = form_edit(&weekly, "Cinema | Subir conteúdo!");
+                assert!(apply_edit(&mut weekly, edit), "só o texto mudou");
+            }
+            assert_eq!(
+                weekly.series_datetime, "2026-09-30T08:00:00",
+                "round {round}"
+            );
+        }
+
+        advance_after(&mut weekly, at("2026-09-30T15:00:00")).expect("concluir");
+        assert_eq!(weekly.datetime, "2026-10-07T08:00:00");
+        assert!(weekly.series_datetime.is_empty());
+        assert_eq!(weekly.text, "Cinema | Subir conteúdo!");
+    }
+
+    /// Dados gravados pela v0.8.0: adiamento com segundos no horário. Abrir no
+    /// formulário e salvar sem mexer (o formulário manda HH:MM:00) não pode
+    /// soltar a série — era o caminho que ainda fazia a série "andar".
+    #[test]
+    fn saving_an_old_snoozed_reminder_unchanged_keeps_the_series() {
+        let mut weekly = note("cinema", "2026-09-30T14:47:33", Repeat::Weekly);
+        weekly.series_datetime = "2026-09-30T08:00:00".into();
+        let mut untouched = weekly.clone();
+        untouched.datetime = "2026-09-30T14:47:00".into();
+        untouched.series_datetime.clear();
+
+        assert!(apply_edit(&mut weekly, untouched));
+        assert_eq!(weekly.series_datetime, "2026-09-30T08:00:00");
+        advance_after(&mut weekly, at("2026-09-30T15:00:00")).expect("concluir");
+        assert_eq!(weekly.datetime, "2026-10-07T08:00:00");
+    }
+
+    /// Mudar a hora no formulário redefine a série, de propósito.
+    #[test]
+    fn changing_the_time_in_the_form_redefines_the_series() {
+        let mut weekly = note("cinema", "2026-09-30T14:47:00", Repeat::Weekly);
+        weekly.series_datetime = "2026-09-30T08:00:00".into();
+        let mut edited = weekly.clone();
+        edited.datetime = "2026-09-30T10:00:00".into();
+
+        assert!(!apply_edit(&mut weekly, edited));
+        assert!(weekly.series_datetime.is_empty());
+        advance_after(&mut weekly, at("2026-09-30T15:00:00")).expect("concluir");
+        assert_eq!(weekly.datetime, "2026-10-07T10:00:00");
     }
 }

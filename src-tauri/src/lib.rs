@@ -15,7 +15,8 @@ use repository::{
     LoadError,
 };
 use scheduler::{
-    advance_after, is_due, occurrence_key, reschedule_to, snooze, snooze_until_tomorrow,
+    advance_after, apply_edit, is_due, occurrence_key, prepare_new, reschedule_to, snooze,
+    snooze_until_tomorrow,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -353,13 +354,6 @@ fn update_notes<R>(
     Ok(result)
 }
 
-/// Mesmo horário para o formulário, que só edita até o minuto: lembretes
-/// adiados por versões antigas guardavam segundos.
-fn same_minute(left: &str, right: &str) -> bool {
-    left.get(..16)
-        .is_some_and(|prefix| Some(prefix) == right.get(..16))
-}
-
 const NOT_PENDING: &str = "Este lembrete não está mais pendente.";
 
 /// Age sobre um lembrete que está na fila do toast. As ações do toast e dos
@@ -431,34 +425,10 @@ fn save_notification(
         let mut next = notifications.clone();
         let slot_kept = match next.iter_mut().find(|item| item.id == notification.id) {
             None => {
-                notification.done = false;
-                notification.last_fired.clear();
-                notification.series_datetime.clear();
-                notification.series_day = 0;
-                next.push(notification);
+                next.push(prepare_new(notification));
                 false
             }
-            Some(existing) => {
-                let kept = same_minute(&existing.datetime, &notification.datetime)
-                    && existing.repeat == notification.repeat;
-                if kept {
-                    existing.text = notification.text;
-                } else {
-                    // Data ou repetição novas: a âncora antiga da série não
-                    // vale mais. Só a hora mudou (mesmo dia, mesma repetição):
-                    // o dia pretendido da série mensal continua valendo — um
-                    // "todo dia 31" parado em 28/02 não pode virar "dia 28".
-                    let same_day = existing.datetime.get(..10).is_some()
-                        && existing.datetime.get(..10) == notification.datetime.get(..10)
-                        && existing.repeat == notification.repeat;
-                    notification.series_day = if same_day { existing.series_day } else { 0 };
-                    notification.done = false;
-                    notification.last_fired.clear();
-                    notification.series_datetime.clear();
-                    *existing = notification;
-                }
-                kept
-            }
+            Some(existing) => apply_edit(existing, notification),
         };
         persist_notifications(&paths, &next)?;
         if slot_kept {
