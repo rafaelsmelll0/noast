@@ -11,6 +11,9 @@
   --accent-strong: #9a6e00;
   --danger: #c93d35;
   --danger-soft: #fff0ee;
+  --radius-md: 9px;
+  --radius-lg: 12px;
+  --shadow: 0 10px 28px rgb(0 0 0 / 16%);
   font-family: Inter, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
 }
 
@@ -50,10 +53,12 @@
   box-sizing: border-box;
 }
 
+/* A janela acompanha a altura do painel (custom-snooze.js avisa o backend):
+   compacta com tudo fechado, maior só enquanto o calendário ou a lista de
+   horas estão abertos. */
 html,
 body {
   width: 300px;
-  height: 430px;
   margin: 0;
   overflow: hidden;
   background: transparent;
@@ -70,7 +75,6 @@ body {
   display: flex;
   flex-direction: column;
   gap: 9px;
-  height: 100%;
   padding: 12px;
   background: var(--surface);
   border: 1px solid color-mix(in srgb, var(--line) 75%, transparent);
@@ -100,20 +104,44 @@ body {
   font-weight: 700;
 }
 
-.field input {
-  width: 100%;
+/* Calendário e lista de horas abrem DENTRO do painel (em fluxo, ocupando a
+   linha inteira) em vez de flutuar: numa janela deste tamanho um popup
+   flutuante seria cortado pela borda. */
+.field .date-field,
+.field .time-field-input {
   min-height: 32px;
-  padding: 0 9px;
-  background: var(--surface-soft);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  color: var(--ink);
-  font: inherit;
+  font-size: 12px;
 }
 
-.field input:focus-visible {
-  outline: 0;
-  border-color: var(--accent);
+.field .date-field {
+  padding: 0 9px;
+}
+
+.field .time-field-input {
+  padding: 0 0 0 9px;
+}
+
+.field .date-popover,
+.field .time-popover {
+  position: static;
+  grid-column: 1 / -1;
+  width: auto;
+  max-width: none;
+  box-shadow: none;
+  background: var(--surface-soft);
+}
+
+.field .date-popover {
+  padding: 8px;
+}
+
+.field .date-day {
+  aspect-ratio: auto;
+  height: 28px;
+}
+
+.field .time-column {
+  max-height: 150px;
 }
 
 .error {
@@ -130,7 +158,7 @@ body {
 .actions {
   display: flex;
   gap: 6px;
-  margin-top: auto;
+  margin-top: 3px;
 }
 
 .actions button {

@@ -1,0 +1,129 @@
+/* Seletor de hora próprio (substitui o nativo do WebView2). Autossuficiente
+   como o calendário: também é usado na janela Personalizar. */
+.time-input-hidden {
+  display: none !important;
+}
+
+.time-field {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md, 10px);
+}
+
+.time-field:focus-within {
+  border-color: var(--accent);
+}
+
+.time-field-input {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 11px 0 11px 12px;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  user-select: text;
+}
+
+.time-field-input::placeholder {
+  color: var(--muted);
+}
+
+.time-field-toggle,
+.time-popover button {
+  margin: 0;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.time-field-toggle {
+  display: grid;
+  flex: 0 0 auto;
+  width: 34px;
+  align-self: stretch;
+  place-items: center;
+  background: transparent;
+  border-radius: 0 var(--radius-md, 10px) var(--radius-md, 10px) 0;
+  color: var(--muted);
+}
+
+.time-field-toggle:hover {
+  background: var(--surface-hover);
+  color: var(--ink);
+}
+
+.time-field-toggle svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.time-popover {
+  position: fixed;
+  z-index: 40;
+  top: 0;
+  left: 0;
+  width: 150px;
+  max-width: calc(100vw - 16px);
+  margin: 0;
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg, 14px);
+  box-shadow: var(--shadow, 0 12px 32px rgb(0 0 0 / 18%));
+}
+
+.time-popover[hidden] {
+  display: none;
+}
+
+.time-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.time-column {
+  display: flex;
+  max-height: 184px;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+
+.time-option {
+  flex: 0 0 auto;
+  padding: 6px 0;
+  background: transparent;
+  border-radius: 8px;
+  color: var(--body);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  text-align: center;
+}
+
+.time-option:hover {
+  background: var(--surface-hover);
+  color: var(--ink);
+}
+
+.time-option.is-selected {
+  background: var(--ink);
+  color: var(--surface);
+}

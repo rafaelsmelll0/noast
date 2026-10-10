@@ -1,4 +1,25 @@
-/* Calendário próprio (substitui o seletor nativo do WebView2) */
+/* Calendário próprio (substitui o seletor nativo do WebView2).
+   Autossuficiente: também é usado na janela Personalizar, que não carrega o
+   styles.css — por isso os resets de botão/ícone e os valores padrão das
+   variáveis ficam aqui. */
+.date-field,
+.date-popover button {
+  margin: 0;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.date-field svg,
+.date-popover svg {
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
 .date-input-hidden {
   display: none !important;
 }
@@ -12,7 +33,7 @@
   padding: 11px 12px;
   background: var(--surface-soft);
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-md, 10px);
   color: var(--ink);
   cursor: pointer;
   font: inherit;
@@ -53,8 +74,8 @@
   padding: 12px;
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow);
+  border-radius: var(--radius-lg, 14px);
+  box-shadow: var(--shadow, 0 12px 32px rgb(0 0 0 / 18%));
 }
 
 .date-popover-header {
@@ -160,4 +181,8 @@
 
 .date-today:hover {
   background: var(--surface-hover);
+}
+
+.date-popover[hidden] {
+  display: none;
 }

@@ -37,6 +37,7 @@ const COMMANDS: &[&str] = &[
     "open_custom_snooze",
     "get_custom_snooze_target",
     "hide_custom_snooze",
+    "resize_custom_snooze",
     "reschedule_notification",
     "take_new_reminder_request",
     "ready_to_quit",

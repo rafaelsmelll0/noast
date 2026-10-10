@@ -1,5 +1,6 @@
 import { createConfirmDialog } from "./confirm-dialog.js";
 import { attachDatePicker } from "./date-picker.js";
+import { attachTimePicker } from "./time-picker.js";
 import { createNotesController } from "./notes.js";
 import { createVaultController, requestCloseVaultForms } from "./vault.js";
 
@@ -90,6 +91,7 @@ const elements = {
 // Criado já aqui (e não junto dos outros listeners) porque openModal/closeModal
 // o usam e podem rodar cedo, pelo evento "open-new-reminder" da bandeja.
 const reminderPicker = attachDatePicker(elements.date);
+const reminderTimePicker = attachTimePicker(elements.time);
 
 function errorMessage(error) {
   if (typeof error === "string") return error;
@@ -608,6 +610,7 @@ async function openNewReminder() {
 
 function openModal(notification = null, duplicate = false) {
   reminderPicker?.close();
+  reminderTimePicker?.close();
   state.editingId = notification && !duplicate ? notification.id : null;
   state.editingSnapshot = state.editingId ? { ...notification } : null;
   // Abrir um lembrete já concluído não merece aviso; concluir durante a
@@ -648,6 +651,7 @@ function openModal(notification = null, duplicate = false) {
 
 function closeModal() {
   reminderPicker?.close();
+  reminderTimePicker?.close();
   elements.modal.hidden = true;
   state.editingId = null;
   state.editingSnapshot = null;

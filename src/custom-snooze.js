@@ -1,4 +1,5 @@
 import { attachDatePicker } from "./date-picker.js";
+import { attachTimePicker } from "./time-picker.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -58,6 +59,23 @@ function prefillDefaults() {
 }
 
 const picker = attachDatePicker(dateInput);
+const timePicker = attachTimePicker(timeInput);
+
+// A janela tem o tamanho do painel: compacta normalmente e maior só enquanto
+// o calendário ou a lista de horas estão abertos (eles abrem dentro do
+// painel). O backend reposiciona mantendo a janela colada à linha do toast.
+const panel = document.querySelector(".panel");
+let lastHeight = 0;
+function reportHeight(force = false) {
+  // + padding do body (3 px em cima e embaixo).
+  const height = Math.ceil(panel.getBoundingClientRect().height + 6);
+  if (!force && Math.abs(height - lastHeight) < 1) return;
+  lastHeight = height;
+  invoke("resize_custom_snooze", { height }).catch(() => {
+    // Sem redimensionar, a janela só fica com o tamanho anterior.
+  });
+}
+new ResizeObserver(() => reportHeight()).observe(panel);
 
 // A janela é reutilizada (mostrada/ocultada), não recriada. Este reset devolve
 // o estado inicial a cada abertura: sem erro, botão habilitado, calendário
@@ -71,7 +89,11 @@ function reset() {
   clearError();
   confirmBtn.disabled = false;
   picker?.close();
+  timePicker?.close();
   prefillDefaults();
+  // O backend abre com uma altura estimada; corrige pelo conteúdo real (o
+  // ResizeObserver não dispara se o painel não mudou desde a última vez).
+  window.setTimeout(() => reportHeight(true), 0);
   // O <input type="date"> original fica escondido (focá-lo não fazia nada);
   // o foco vai para o campo visível do calendário. Aqui o rAF é proposital:
   // se a janela ainda não foi mostrada, o foco espera até ela aparecer.
@@ -121,11 +143,11 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.key !== "Enter") return;
   // Enter no calendário só escolhe o dia (ou navega), sem confirmar na hora.
-  if (picker?.isOpen()) return;
+  if (picker?.isOpen() || timePicker?.isOpen()) return;
   // Só confirma a partir dos campos ou do próprio Confirmar. Em Cancelar, o
   // Enter segue o comportamento normal do botão (fechar sem reagendar).
   const target = event.target;
-  if (target !== timeInput && target !== picker?.field && target !== confirmBtn) return;
+  if (target !== timePicker?.field && target !== picker?.field && target !== confirmBtn) return;
   // Impede que o Enter também "clique" o botão focado (abrir o calendário ou
   // disparar o Confirmar uma segunda vez).
   event.preventDefault();

@@ -55,7 +55,7 @@ struct SnoozeMenuSession {
     opened_at: Option<Instant>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 struct SnoozeMenuAnchor {
     x: f64,
     top: f64,
@@ -70,7 +70,13 @@ struct CustomSnoozeSession {
     target_id: Option<String>,
     visible: bool,
     opened_at: Option<Instant>,
+    /// Linha do toast ao lado da qual a janela abriu: a janela muda de altura
+    /// (calendário/lista de horas abrem dentro dela) e é reposicionada junto.
+    anchor: Option<SnoozeMenuAnchor>,
 }
+
+/// Largura da janela Personalizar; a altura acompanha o conteúdo.
+const CUSTOM_SNOOZE_WIDTH: f64 = 300.0;
 
 /// Um submenu esquecido aberto não pode desligar para sempre o watchdog do
 /// toast: passado este tempo, o toast volta a ser resgatado mesmo assim.
@@ -1164,8 +1170,9 @@ fn open_custom_snooze(
     id: String,
     anchor: SnoozeMenuAnchor,
 ) -> Result<bool, String> {
-    const WIDTH: f64 = 300.0;
-    const HEIGHT: f64 = 430.0;
+    // Altura do painel com tudo fechado; o frontend corrige pelo conteúdo real
+    // logo depois (resize_custom_snooze).
+    const HEIGHT: f64 = 172.0;
 
     let toast = app
         .get_webview_window("toast")
@@ -1179,8 +1186,12 @@ fn open_custom_snooze(
 
     // O alvo é gravado antes de exibir: o frontend o consulta ao receber
     // "custom-snooze-open".
-    lock(&state.0, "personalizar adiamento")?.target_id = Some(id);
-    place_beside_toast(&toast, &window, &anchor, WIDTH, HEIGHT)?;
+    {
+        let mut session = lock(&state.0, "personalizar adiamento")?;
+        session.target_id = Some(id);
+        session.anchor = Some(anchor.clone());
+    }
+    place_beside_toast(&toast, &window, &anchor, CUSTOM_SNOOZE_WIDTH, HEIGHT)?;
 
     let always_on_top = lock(&settings.0, "configurações")?.alert_always_on_top;
     // Primeiro exibe sem ativação — é o que garante que a janela apareça e
@@ -1221,6 +1232,31 @@ fn get_custom_snooze_target(
         .ok_or_else(|| "Nenhum lembrete selecionado.".to_string())?;
     log(&app, &format!("Personalizar: alvo consultado ({id})."));
     Ok(id)
+}
+
+/// A janela Personalizar mudou de altura (abriu/fechou o calendário ou a lista
+/// de horas): ajusta o tamanho e a reposiciona ao lado da mesma linha do toast.
+/// Acima da linha, cresce para cima (a borda de baixo fica no lugar).
+#[tauri::command]
+fn resize_custom_snooze(
+    app: AppHandle,
+    state: tauri::State<CustomSnoozeState>,
+    height: f64,
+) -> Result<(), String> {
+    if !height.is_finite() {
+        return Err("Altura inválida.".to_string());
+    }
+    let height = height.clamp(120.0, 560.0);
+    let Some(anchor) = lock(&state.0, "personalizar adiamento")?.anchor.clone() else {
+        return Ok(());
+    };
+    let toast = app
+        .get_webview_window("toast")
+        .ok_or_else(|| "Janela de alerta indisponível.".to_string())?;
+    let window = app
+        .get_webview_window("custom-snooze")
+        .ok_or_else(|| "Janela de personalização indisponível.".to_string())?;
+    place_beside_toast(&toast, &window, &anchor, CUSTOM_SNOOZE_WIDTH, height)
 }
 
 #[tauri::command]
@@ -1461,7 +1497,7 @@ fn create_custom_snooze_window(
         WebviewUrl::App("custom-snooze.html".into()),
     )
     .title("")
-    .inner_size(300.0, 430.0)
+    .inner_size(300.0, 172.0)
     .resizable(false)
     .decorations(false)
     .transparent(true)
@@ -2379,6 +2415,7 @@ pub fn run() {
             open_custom_snooze,
             get_custom_snooze_target,
             hide_custom_snooze,
+            resize_custom_snooze,
             reschedule_notification,
             take_new_reminder_request,
             ready_to_quit,

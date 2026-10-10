@@ -7,19 +7,20 @@
     <title>Personalizar adiamento</title>
     <link rel="stylesheet" href="custom-snooze.css" />
     <link rel="stylesheet" href="date-picker.css" />
+    <link rel="stylesheet" href="time-picker.css" />
     <script type="module" src="custom-snooze.js"></script>
   </head>
   <body>
     <div class="panel" role="dialog" aria-label="Personalizar adiamento">
       <p class="panel-title">Adiar para…</p>
-      <label class="field">
-        <span>Data</span>
-        <input id="date" type="date" />
-      </label>
-      <label class="field">
-        <span>Hora</span>
-        <input id="time" type="time" />
-      </label>
+      <div class="field">
+        <span id="dateLabel">Data</span>
+        <input id="date" type="date" aria-labelledby="dateLabel" />
+      </div>
+      <div class="field">
+        <span id="timeLabel">Hora</span>
+        <input id="time" type="time" aria-labelledby="timeLabel" />
+      </div>
       <p id="error" class="error" role="alert" hidden></p>
       <div class="actions">
         <button id="cancel" type="button" class="ghost">Cancelar</button>
